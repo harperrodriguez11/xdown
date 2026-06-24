@@ -288,27 +288,27 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds):
 # ───────────────────────── Google Drive upload ─────────────────────────
 
 def get_drive_service():
+    import json as _json
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
 
-    client_id = os.environ.get("GDRIVE_CLIENT_ID")
-    client_secret = os.environ.get("GDRIVE_CLIENT_SECRET")
-    refresh_token = os.environ.get("GDRIVE_REFRESH_TOKEN")
-
-    if not all([client_id, client_secret, refresh_token]):
+    raw = os.environ.get("GDRIVE_TOKEN_JSON")
+    if not raw:
         raise RuntimeError(
-            "Missing one of GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET / GDRIVE_REFRESH_TOKEN "
-            "environment variables (set them as GitHub Secrets)."
+            "Missing GDRIVE_TOKEN_JSON environment variable. "
+            "Set it as a single GitHub Secret containing the full token JSON "
+            "(token, refresh_token, client_id, client_secret, token_uri, scopes)."
         )
 
+    info = _json.loads(raw)
     creds = Credentials(
-        token=None,
-        refresh_token=refresh_token,
-        client_id=client_id,
-        client_secret=client_secret,
-        token_uri="https://oauth2.googleapis.com/token",
-        scopes=["https://www.googleapis.com/auth/drive"],
+        token=info.get("token"),
+        refresh_token=info["refresh_token"],
+        client_id=info["client_id"],
+        client_secret=info["client_secret"],
+        token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
+        scopes=info.get("scopes", ["https://www.googleapis.com/auth/drive"]),
     )
     creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
