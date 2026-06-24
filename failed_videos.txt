@@ -2,3 +2,5 @@ https://x.com/hot_celebs_x/status/2016579528181895652	ERROR: [twitter] 201657952
 https://x.com/hot_celebs_x/status/2016910709750411335	ERROR: [twitter] 2016910709750411335: No video could be found in this tweet	2026-06-24 03:16:10
 https://x.com/hot_celebs_x/status/2016971610826375229	ERROR: [twitter] 2016971610826375229: No video could be found in this tweet	2026-06-24 03:16:13
 https://x.com/hot_celebs_x/status/2017298012314255567	ERROR: [twitter] 2017298012314255567: No video could be found in this tweet	2026-06-24 03:16:17
+https://x.com/HotCelebrityX/status/2064740371847082367	ERROR: [twitter] 2064740371847082367: No video formats found!; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on 	2026-06-24 03:25:05
+https://x.com/hot_celebs_x/status/2064830968767340734	ERROR: [twitter] 2064830968767340734: No video formats found!; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on 	2026-06-24 03:25:13
