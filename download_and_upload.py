@@ -2,11 +2,28 @@
 """
 download_and_upload.py
 =======================
-Reads tweet/X URLs from urlsnow.txt (repo root), downloads videos with yt-dlp
-(retrying transient failures with backoff + a rate-limit cooldown instead of
-giving up), then uploads everything into a new Google Drive folder.
+Reads tweet/X URLs from urlsnow.txt (repo root). For each URL:
+    - if the tweet has a video (or animated GIF) -> download it with yt-dlp
+    - if the tweet has photo(s) -> download the full-resolution image(s)
+      directly (yt-dlp itself never returns photo URLs as downloadable
+      formats, only as a "no video" signal -- see NOTE below)
+    - a tweet can have BOTH a video and photos are mutually exclusive on
+      Twitter/X in practice (a tweet is either a video tweet or a photo
+      tweet), but a URL list can freely mix video URLs and photo URLs.
+Retries transient failures with backoff + a rate-limit cooldown instead of
+giving up, then uploads everything (videos + images) into a single new
+Google Drive folder.
 
 Designed to run inside GitHub Actions via workflow_dispatch.
+
+NOTE on images: yt-dlp's Twitter extractor only ever surfaces *video*
+entries as downloadable "formats" -- photo entries are explicitly filtered
+out internally and the actual photo URLs are discarded before being
+returned to callers. So for image tweets we go straight to Twitter's
+public, no-auth syndication endpoint (the same one yt-dlp itself falls
+back to for metadata: https://cdn.syndication.twimg.com/tweet-result) to
+read out the real `media_url_https` values, then download those files
+ourselves with a plain HTTP GET. No login/cookies needed for this part.
 
 Env vars expected (set as GitHub Secrets):
     GDRIVE_CLIENT_ID
@@ -15,9 +32,9 @@ Env vars expected (set as GitHub Secrets):
 
 CLI args (passed from workflow inputs):
     --folder-name   (required) name of the Drive folder to create & upload into
-    --min-duration  (optional) seconds or mm:ss
-    --max-duration  (optional) seconds or mm:ss
-    --delay         (optional) seconds between videos, default 8
+    --min-duration  (optional) seconds or mm:ss -- only applied to videos
+    --max-duration  (optional) seconds or mm:ss -- only applied to videos
+    --delay         (optional) seconds between items, default 8
 
 Progress / dedup files (committed back to the repo by the workflow):
     downloaded_videos.txt   permanent skip-list of already-downloaded URLs
@@ -28,11 +45,13 @@ import os
 import re
 import sys
 import time
+import math
 import argparse
-import zipfile
 from datetime import datetime
+from urllib.parse import urlparse
 
 import yt_dlp
+import requests
 
 REPO_ROOT = os.getcwd()
 URLS_FILE = os.path.join(REPO_ROOT, "urlsnow.txt")
@@ -140,10 +159,109 @@ def sleep_interruptible(seconds):
     time.sleep(seconds)
 
 
-# ───────────────────────── download engine ─────────────────────────
+def safe_filename_piece(text, max_len=80):
+    text = re.sub(r'[^A-Za-z0-9._-]+', '_', text or '')
+    text = re.sub(r'_+', '_', text).strip('_')
+    return text[:max_len] or "untitled"
+
+
+# ───────────────────────── image (photo tweet) engine ─────────────────────────
+
+def fetch_tweet_media_via_syndication(twid: str):
+    """Returns list of media dicts: {'type': 'photo'|'video'|'animated_gif', 'url': ...}.
+
+    Reuses yt-dlp's own TwitterIE._call_syndication_api(), which talks to
+    Twitter/X's public, unauthenticated syndication endpoint (no login or
+    cookies required). We delegate to yt-dlp's actual current implementation
+    rather than reimplementing the token/request logic ourselves, so this
+    keeps working even if Twitter/X or yt-dlp change the token algorithm.
+    """
+    from yt_dlp.extractor.twitter import TwitterIE
+
+    ydl = yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True})
+    ie = TwitterIE(ydl)
+    status = ie._call_syndication_api(twid)
+    if not status:
+        return []
+
+    media = []
+    for detail in (status.get("extended_entities", {}).get("media") or []):
+        mtype = detail.get("type")
+        if mtype == "photo":
+            url = detail.get("media_url_https") or detail.get("media_url")
+            if url:
+                media.append({"type": "photo", "url": url})
+        # video/animated_gif are left for yt-dlp's normal download path;
+        # we only need photos here.
+    return media
+
+
+def download_image(url, dest_dir, basename_hint):
+    os.makedirs(dest_dir, exist_ok=True)
+    parsed = urlparse(url)
+    ext = os.path.splitext(parsed.path)[1].lstrip('.').lower() or "jpg"
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
+        ext = "jpg"
+
+    # request the largest size explicitly (pbs.twimg.com supports ?name=orig)
+    full_url = url
+    if "pbs.twimg.com" in url:
+        from urllib.parse import parse_qsl, urlencode, urlunparse
+        query_pairs = [(k, v) for k, v in parse_qsl(parsed.query) if k != "name"]
+        query_pairs.append(("name", "orig"))
+        full_url = urlunparse(parsed._replace(query=urlencode(query_pairs)))
+
+    filename = f"{basename_hint}.{ext}"
+    filepath = os.path.join(dest_dir, filename)
+
+    resp = requests.get(full_url, timeout=30, stream=True)
+    resp.raise_for_status()
+    with open(filepath, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1 << 16):
+            if chunk:
+                f.write(chunk)
+    return filepath
+
+
+def download_images_for_tweet(url, twid):
+    """Returns (success: bool, was_rate_limited: bool, filepaths: list[str])."""
+    from yt_dlp.utils import ExtractorError
+
+    try:
+        media = fetch_tweet_media_via_syndication(twid)
+    except ExtractorError as e:
+        raw = str(e)
+        low = raw.lower()
+        is_rate_limit = any(p in low for p in RATE_LIMIT_PHRASES)
+        return False, is_rate_limit, []
+    except Exception:
+        return False, False, []
+
+    photos = [m for m in media if m["type"] == "photo"]
+    if not photos:
+        return False, False, []
+
+    filepaths = []
+    for idx, photo in enumerate(photos, 1):
+        basename_hint = safe_filename_piece(f"{twid}_img{idx}")
+        try:
+            fp = download_image(photo["url"], DOWNLOAD_DIR, basename_hint)
+            filepaths.append(fp)
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ Failed to fetch image {idx} for {twid}: {str(e)[:100]}")
+            continue
+
+    return (len(filepaths) > 0), False, filepaths
+
+
+# ───────────────────────── video download engine ─────────────────────────
 
 def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seconds):
-    """Returns (success: bool, was_rate_limited: bool, filepath_hint: str|None)."""
+    """Returns (kind, success, was_rate_limited, filepaths)
+    kind is one of: 'video', 'image', 'none'
+    filepaths is a list (video downloads produce exactly one entry on success).
+    """
+    twid = extract_tweet_id(url)
     attempt = 0
     delay = RETRY_BASE_DELAY
     while True:
@@ -160,7 +278,7 @@ def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seco
                     delay = min(delay * 2, RETRY_MAX_DELAY)
                     continue
                 append_failed(url, "no info after retries")
-                return False, True, None
+                return 'none', False, True, []
 
             formats = info.get('formats', [])
             title = info.get('title', 'Unknown')
@@ -168,20 +286,39 @@ def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seco
             duration = info.get('duration')
 
             if not formats:
-                print(f"🖼️ {title} [{video_id}]: image-only tweet, no video. Skipping permanently.")
-                append_failed(url, "image-only / no formats")
-                return False, False, None
+                # No video formats -- this is very likely a photo tweet.
+                # Try to pull the actual image(s) via the syndication endpoint.
+                print(f"🖼️ {title} [{video_id}]: no video formats — checking for image(s)...")
+                if not twid:
+                    append_failed(url, "no formats, no tweet id for image fallback")
+                    return 'none', False, False, []
+
+                ok, was_rate_limited, filepaths = download_images_for_tweet(url, twid)
+                if ok:
+                    append_downloaded(url, f"{title} [{len(filepaths)} image(s)]")
+                    print(f"✅ Saved {len(filepaths)} image(s) for {twid}")
+                    return 'image', True, False, filepaths
+
+                if was_rate_limited and attempt < MAX_RETRIES:
+                    print(f"   Image fetch looked rate-limited, retrying in {delay}s...")
+                    sleep_interruptible(delay)
+                    delay = min(delay * 2, RETRY_MAX_DELAY)
+                    continue
+
+                print(f"🖼️ {title} [{video_id}]: no image or video could be retrieved. Skipping permanently.")
+                append_failed(url, "image-only / no formats, image fetch failed")
+                return 'none', False, was_rate_limited, []
 
             if duration is not None:
                 duration_int = int(duration)
                 if min_seconds is not None and duration_int < min_seconds:
                     print(f"⏩ {title} [{video_id}]: shorter than min duration — skipped.")
-                    return False, False, None
+                    return 'none', False, False, []
                 if max_seconds is not None and duration_int > max_seconds:
                     print(f"⏩ {title} [{video_id}]: longer than max duration — skipped.")
-                    return False, False, None
+                    return 'none', False, False, []
 
-            print(f"⬇️ Downloading: {title[:60]} [{video_id}]")
+            print(f"⬇️ Downloading video: {title[:60]} [{video_id}]")
             with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_dl:
                 result = ydl_dl.extract_info(url, download=True)
                 filepath = ydl_dl.prepare_filename(result)
@@ -191,8 +328,8 @@ def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seco
                     filepath = mp4_path
 
             append_downloaded(url, title)
-            print(f"✅ Saved: {title[:60]}")
-            return True, False, filepath
+            print(f"✅ Saved video: {title[:60]}")
+            return 'video', True, False, [filepath]
 
         except Exception as e:
             raw = str(e)
@@ -202,14 +339,22 @@ def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seco
             is_transient = any(p in low for p in TRANSIENT_PHRASES)
 
             if is_no_video and not is_transient:
-                print(f"🖼️ {url}: no video present — skipping permanently. ({raw[:120]})")
+                # Same as "no formats" path above -- try images before giving up.
+                print(f"🖼️ {url}: no video present ({raw[:100]}) — checking for image(s)...")
+                if twid:
+                    ok, was_rate_limited, filepaths = download_images_for_tweet(url, twid)
+                    if ok:
+                        append_downloaded(url, f"[{len(filepaths)} image(s)]")
+                        print(f"✅ Saved {len(filepaths)} image(s) for {twid}")
+                        return 'image', True, False, filepaths
+                print(f"🖼️ {url}: no image or video found — skipping permanently.")
                 append_failed(url, raw[:200])
-                return False, False, None
+                return 'none', False, False, []
 
             if attempt >= MAX_RETRIES:
                 print(f"❌ {url}: failed after {attempt} attempts. Error: {raw[:150]}")
                 append_failed(url, raw[:200])
-                return False, is_rate_limit, None
+                return 'none', False, is_rate_limit, []
 
             print(f"⚠️ Attempt {attempt}/{MAX_RETRIES} failed ({raw[:100]}). Retrying in {delay}s...")
             sleep_interruptible(delay)
@@ -239,7 +384,7 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds):
     }
 
     downloaded_ids, downloaded_urls = load_downloaded_set()
-    stats = {'success': 0, 'skipped': 0, 'failed': 0, 'duplicates': 0}
+    stats = {'success_video': 0, 'success_image': 0, 'skipped': 0, 'failed': 0, 'duplicates': 0}
     new_files = []
     consecutive_rate_limit = 0
     total = len(urls)
@@ -255,15 +400,21 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds):
             stats['skipped'] += 1
             continue
 
-        ok, was_rate_limited, filepath = download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seconds)
+        kind, ok, was_rate_limited, filepaths = download_one(
+            url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seconds
+        )
 
         if ok:
-            stats['success'] += 1
+            if kind == 'video':
+                stats['success_video'] += 1
+            elif kind == 'image':
+                stats['success_image'] += 1
             downloaded_urls.add(url)
             if tid:
                 downloaded_ids.add(tid)
-            if filepath and os.path.exists(filepath):
-                new_files.append(filepath)
+            for fp in filepaths:
+                if fp and os.path.exists(fp):
+                    new_files.append(fp)
         elif was_rate_limited:
             stats['failed'] += 1
         else:
@@ -315,7 +466,6 @@ def get_drive_service():
 
 
 def create_drive_folder(service, folder_name):
-    from googleapiclient.errors import HttpError
     metadata = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
     folder = service.files().create(body=metadata, fields="id, webViewLink").execute()
     return folder["id"], folder.get("webViewLink")
@@ -361,12 +511,13 @@ def main():
         print(f"🔁 Removed {len(list_dupes)} duplicate URL(s) within urlsnow.txt.")
 
     print(f"Starting run: {len(urls)} unique URL(s), folder='{folder_name}', "
-          f"min={min_seconds}, max={max_seconds}, delay={delay_seconds}s")
+          f"min={min_seconds}, max={max_seconds}, delay={delay_seconds}s "
+          f"(videos AND photo-tweet images will both be downloaded)")
 
     stats, new_files = run_downloads(urls, min_seconds, max_seconds, delay_seconds)
 
-    print(f"\n📊 Download summary: success={stats['success']} skipped={stats['skipped']} "
-          f"failed={stats['failed']} duplicates={stats['duplicates']}")
+    print(f"\n📊 Download summary: videos={stats['success_video']} images={stats['success_image']} "
+          f"skipped={stats['skipped']} failed={stats['failed']} duplicates={stats['duplicates']}")
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
 
@@ -375,8 +526,9 @@ def main():
         if summary_path:
             with open(summary_path, "a", encoding="utf-8") as f:
                 f.write(f"### Download run\nNo new files downloaded.\n\n"
-                        f"- Success: {stats['success']}\n- Skipped: {stats['skipped']}\n"
-                        f"- Failed: {stats['failed']}\n- Duplicates: {stats['duplicates']}\n")
+                        f"- Videos: {stats['success_video']}\n- Images: {stats['success_image']}\n"
+                        f"- Skipped: {stats['skipped']}\n- Failed: {stats['failed']}\n"
+                        f"- Duplicates: {stats['duplicates']}\n")
         return
 
     print(f"\nUploading {len(new_files)} file(s) to Google Drive folder '{folder_name}'...")
@@ -391,8 +543,9 @@ def main():
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
             f.write(f"### Download + Upload run\n\n"
-                    f"- Success: {stats['success']}\n- Skipped: {stats['skipped']}\n"
-                    f"- Failed: {stats['failed']}\n- Duplicates: {stats['duplicates']}\n\n"
+                    f"- Videos: {stats['success_video']}\n- Images: {stats['success_image']}\n"
+                    f"- Skipped: {stats['skipped']}\n- Failed: {stats['failed']}\n"
+                    f"- Duplicates: {stats['duplicates']}\n\n"
                     f"**Drive folder:** [{folder_name}]({folder_link})\n\n"
                     f"Uploaded files:\n" + "\n".join(f"- {n}" for n in uploaded) + "\n")
 
