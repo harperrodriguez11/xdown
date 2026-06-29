@@ -2,11 +2,7 @@
 """
 download_and_upload.py
 Reads tweet/X URLs from urlsnow.txt. Downloads images or videos, enforcing
-duration limits even when metadata is missing (livestreams/VODs) via:
-  1. Metadata duration check  (fast, before any download)
-  2. match_filter + max_filesize  (aborts before/during download)
-  3. max_fragments cap  (hard-stops HLS/DASH streams, ~2s per fragment)
-  4. ffprobe check after download  (deletes file if out of range)
+duration and size limits. Exits cleanly if nothing to do.
 """
 
 import os, re, sys, time, subprocess, argparse
@@ -16,12 +12,12 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import yt_dlp
 import requests
 
-REPO_ROOT    = os.getcwd()
-URLS_FILE    = os.path.join(REPO_ROOT, "urlsnow.txt")
+REPO_ROOT      = os.getcwd()
+URLS_FILE      = os.path.join(REPO_ROOT, "urlsnow.txt")
 DOWNLOADED_LOG = os.path.join(REPO_ROOT, "downloaded_videos.txt")
-FAILED_LOG   = os.path.join(REPO_ROOT, "failed_videos.txt")
-DOWNLOAD_DIR = os.path.join(REPO_ROOT, "downloads")
-COOKIES_PATH = os.path.join(REPO_ROOT, "cookies.txt")
+FAILED_LOG     = os.path.join(REPO_ROOT, "failed_videos.txt")
+DOWNLOAD_DIR   = os.path.join(REPO_ROOT, "downloads")
+COOKIES_PATH   = os.path.join(REPO_ROOT, "cookies.txt")
 
 MAX_RETRIES      = 5
 RETRY_BASE_DELAY = 8
@@ -29,15 +25,14 @@ RETRY_MAX_DELAY  = 90
 COOLDOWN_TRIGGER = 4
 COOLDOWN_SECONDS = 300
 
-# Used to derive a filesize proxy when duration metadata is absent.
-# 375 KB/s ≈ 3 Mbps (typical 720p Twitter video).
-BYTES_PER_SECOND = 375_000
+SIZE_LIMIT = 40 * 1024 * 1024  # 40 MB hard cap
 
 RATE_LIMIT_PHRASES = [
     'rate','429','503','temporarily','too many requests','unable to extract',
     'http error 5','reset by peer','connection','timed out','timeout','bad guest token',
 ]
 TRANSIENT_PHRASES = RATE_LIMIT_PHRASES + ['login','log in','auth','age','500','network']
+LIMIT_PHRASES     = ['sizelimit','filesize','exceeds','fragment limit','max_fragments']
 
 
 # ─────────────────────────── helpers ────────────────────────────────────────
@@ -114,6 +109,7 @@ def ffprobe_duration(filepath):
 def check_ffmpeg():
     try:
         subprocess.run(['ffmpeg','-version'], capture_output=True, timeout=10)
+        print("✅ ffmpeg found.")
     except Exception:
         print("⚠️  ffmpeg not found — add 'sudo apt-get install -y ffmpeg' to workflow.")
 
@@ -143,7 +139,6 @@ def _install_status_cache_patch():
     TwitterIE._status_cache_patched = True
 
 def _get_media_from_status(twid):
-    """Returns (photos: list, has_video: bool) or (None, None) if not cached."""
     status = _STATUS_CACHE.get(twid)
     if status is None: return None, None
     photos, has_video = [], False
@@ -195,18 +190,27 @@ def download_images_for_tweet(url, twid):
 # ─────────────────── yt-dlp options ─────────────────────────────────────────
 
 def _ydl_extract_opts(cookiefile):
-    return {'quiet':True,'no_warnings':True,'nocheckcertificate':True,
-            'cookiefile':cookiefile,'skip_download':True}
+    return {
+        'quiet': True, 'no_warnings': True,
+        'nocheckcertificate': True, 'cookiefile': cookiefile,
+        'skip_download': True,
+    }
 
 def _ydl_download_opts(cookiefile, max_seconds):
-    SIZE_LIMIT = 40 * 1024 * 1024  # 40 MB
+    """
+    Three layers of size/duration enforcement:
+    1. progress_hook  — fires every chunk, aborts when downloaded bytes > SIZE_LIMIT
+    2. max_fragments  — hard fragment cap for HLS livestreams (~2s per fragment)
+    3. match_filter   — rejects before download if filesize/duration known upfront
+    concurrent_fragments=1 is required so progress_hook byte count is accurate.
+    """
 
     def _progress_hook(d):
         if d.get('status') == 'downloading':
             downloaded = d.get('downloaded_bytes', 0)
             if downloaded and downloaded > SIZE_LIMIT:
                 raise yt_dlp.utils.DownloadError(
-                    f"Aborted: downloaded {downloaded/1e6:.1f}MB exceeds 40MB limit"
+                    f"SIZELIMIT: {downloaded/1e6:.1f}MB exceeds {SIZE_LIMIT/1e6:.0f}MB cap"
                 )
 
     opts = {
@@ -220,7 +224,7 @@ def _ydl_download_opts(cookiefile, max_seconds):
         'ignoreerrors': False,
         'cookiefile': cookiefile,
         'nocheckcertificate': True,
-        'concurrent_fragments': 1,  # must be 1 so progress_hook byte count is accurate
+        'concurrent_fragments': 1,   # must be 1 for accurate progress_hook byte count
         'retries': 3,
         'quiet': False,
         'no_warnings': True,
@@ -231,14 +235,14 @@ def _ydl_download_opts(cookiefile, max_seconds):
     if max_seconds:
         frag_limit = int((max_seconds / 2) * 1.25) + 5
         opts['max_fragments'] = frag_limit
-        print(f"   🔒 Limits: max_fragments={frag_limit}, max_filesize=40MB (enforced via progress hook)")
+        print(f"   🔒 Limits: max_fragments={frag_limit}, max_filesize={SIZE_LIMIT//1_048_576}MB, progress_hook active")
     else:
-        print(f"   🔒 Limits: max_filesize=40MB (enforced via progress hook)")
+        print(f"   🔒 Limits: max_filesize={SIZE_LIMIT//1_048_576}MB, progress_hook active")
 
     def _match_filter(info, *, incomplete):
         fs = info.get('filesize') or info.get('filesize_approx')
         if fs and fs > SIZE_LIMIT:
-            return f"filesize {fs/1e6:.0f}MB > 40MB limit"
+            return f"SIZELIMIT: filesize {fs/1e6:.0f}MB > {SIZE_LIMIT/1e6:.0f}MB limit"
         dur = info.get('duration')
         if dur and max_seconds and int(dur) > max_seconds:
             return f"duration {int(dur)}s > max {max_seconds}s"
@@ -251,6 +255,7 @@ def _ydl_download_opts(cookiefile, max_seconds):
 # ─────────────────── core download ──────────────────────────────────────────
 
 def download_one(url, cookiefile, min_seconds, max_seconds):
+    """Returns (kind, success, was_rate_limited, filepaths)."""
     twid  = extract_tweet_id(url)
     delay = RETRY_BASE_DELAY
 
@@ -262,6 +267,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 info = ydl.extract_info(url, download=False)
         except Exception as e:
             raw = str(e); low = raw.lower()
+            # Hard non-transient failure — try image cache before giving up
             if not any(p in low for p in TRANSIENT_PHRASES):
                 print(f"   ⚠️  extract_info failed: {raw[:120]}")
                 if twid:
@@ -274,7 +280,8 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 _STATUS_CACHE.pop(twid, None)
                 return 'none', False, False, []
             if attempt >= MAX_RETRIES:
-                append_failed(url, raw[:200]); _STATUS_CACHE.pop(twid, None)
+                append_failed(url, raw[:200])
+                _STATUS_CACHE.pop(twid, None)
                 return 'none', False, True, []
             print(f"   ⚠️  Attempt {attempt}/{MAX_RETRIES}: {raw[:80]} — retry in {delay}s")
             time.sleep(delay); delay = min(delay*2, RETRY_MAX_DELAY); continue
@@ -283,7 +290,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
         video_id = (info or {}).get('id', 'unknown') if info else 'unknown'
         label    = f"{title[:55]} [{video_id}]"
 
-        # ── 2. Photo-only check ──────────────────────────────────────────
+        # ── 2. Photo-only check (no video attempt at all) ────────────────
         if twid:
             photos, has_video = _get_media_from_status(twid)
             if photos and not has_video:
@@ -293,7 +300,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 _STATUS_CACHE.pop(twid, None)
                 return ('image', True, False, fps) if ok else ('none', False, False, [])
 
-        # ── 3. No formats at all — try image fallback ────────────────────
+        # ── 3. No video formats — try image fallback ─────────────────────
         if not info or not info.get('formats'):
             print(f"   ℹ️  No video formats — trying cached images...")
             if twid:
@@ -306,19 +313,19 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             _STATUS_CACHE.pop(twid, None)
             return 'none', False, False, []
 
-        # ── 4. Metadata duration check ───────────────────────────────────
+        # ── 4. Metadata duration check (fast path) ───────────────────────
         duration = info.get('duration')
         if duration is not None:
             if not _duration_ok(duration, min_seconds, max_seconds, label):
-                _STATUS_CACHE.pop(twid, None); return 'none', False, False, []
+                append_failed(url, f"duration {int(duration)}s out of range")
+                _STATUS_CACHE.pop(twid, None)
+                return 'none', False, False, []
             print(f"   ⬇️  Downloading ({int(duration)}s): {label}")
         else:
-            # Livestream or VOD — duration unknown.
-            # Fragment cap + filesize limit will enforce max_seconds.
             if max_seconds:
                 frag_cap = int((max_seconds / 2) * 1.25) + 5
                 print(f"   ⚠️  Duration unknown (livestream/VOD). "
-                      f"Enforcing via fragment cap ({frag_cap}) + filesize limit.")
+                      f"Enforcing via fragment cap ({frag_cap}) + size hook.")
             print(f"   ⬇️  Downloading (duration unknown): {label}")
 
         # ── 5. Download ──────────────────────────────────────────────────
@@ -328,8 +335,10 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 result = ydl_dl.extract_info(url, download=True)
 
             if result is None:
-                print(f"   ⏩ Download filtered/aborted (duration or size limit).")
-                _STATUS_CACHE.pop(twid, None); return 'none', False, False, []
+                print(f"   ⏩ Rejected by filter before download.")
+                append_failed(url, "rejected by match_filter")
+                _STATUS_CACHE.pop(twid, None)
+                return 'none', False, False, []
 
             filepath = ydl_dl.prepare_filename(result)
             mp4 = os.path.splitext(filepath)[0] + ".mp4"
@@ -340,37 +349,61 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                         filepath = os.path.join(DOWNLOAD_DIR, fn); break
 
         except yt_dlp.utils.MaxDownloadsReached:
-            print(f"   ⏩ Aborted: fragment limit reached (duration cap enforced).")
-            _STATUS_CACHE.pop(twid, None); return 'none', False, False, []
+            print(f"   ⏩ Aborted: fragment limit reached.")
+            append_failed(url, "fragment limit reached — too long/large")
+            _STATUS_CACHE.pop(twid, None)
+            return 'none', False, False, []
+
         except Exception as e:
             raw = str(e); low = raw.lower()
-            if any(k in low for k in ('filesize','exceeds','duration','max')):
-                print(f"   ⏩ Rejected by filter: {raw[:120]}")
-                _STATUS_CACHE.pop(twid, None); return 'none', False, False, []
+
+            # Size / fragment / duration limit hit — fail immediately, NO retry
+            if any(k in low for k in LIMIT_PHRASES):
+                print(f"   ⏩ Skipping permanently (size/duration limit): {raw[:120]}")
+                append_failed(url, raw[:120])
+                _STATUS_CACHE.pop(twid, None)
+                return 'none', False, False, []
+
+            # Transient error — retry
             is_transient = any(p in low for p in TRANSIENT_PHRASES)
             if attempt < MAX_RETRIES and is_transient:
                 print(f"   ⚠️  Download attempt {attempt} failed: {raw[:80]} — retry in {delay}s")
                 time.sleep(delay); delay = min(delay*2, RETRY_MAX_DELAY); continue
-            append_failed(url, raw[:200]); _STATUS_CACHE.pop(twid, None)
+
+            append_failed(url, raw[:200])
+            _STATUS_CACHE.pop(twid, None)
             return 'none', False, is_transient, []
 
-        # ── 6. ffprobe post-download check ──────────────────────────────
+        # ── 6. ffprobe post-download check ───────────────────────────────
         if os.path.exists(filepath):
             actual = ffprobe_duration(filepath)
             if actual is not None:
                 print(f"   🔍 ffprobe: {int(actual)}s actual duration")
                 if not _duration_ok(actual, min_seconds, max_seconds, f"{label} (actual)"):
                     print(f"   🗑️  Deleting out-of-range file.")
-                    os.remove(filepath); _STATUS_CACHE.pop(twid, None)
+                    os.remove(filepath)
+                    append_failed(url, f"actual duration {int(actual)}s out of range")
+                    _STATUS_CACHE.pop(twid, None)
                     return 'none', False, False, []
             else:
-                print(f"   ⚠️  ffprobe couldn't determine duration — keeping file.")
+                print(f"   ⚠️  ffprobe couldn't read duration — keeping file.")
+
+            # File size sanity check after download
+            file_size = os.path.getsize(filepath)
+            if file_size > SIZE_LIMIT:
+                print(f"   🗑️  File {file_size/1e6:.1f}MB exceeds {SIZE_LIMIT/1e6:.0f}MB — deleting.")
+                os.remove(filepath)
+                append_failed(url, f"file {file_size/1e6:.1f}MB > size limit")
+                _STATUS_CACHE.pop(twid, None)
+                return 'none', False, False, []
         else:
             print(f"   ⚠️  File not found after download: {filepath}")
-            _STATUS_CACHE.pop(twid, None); return 'none', False, False, []
+            append_failed(url, "file missing after download")
+            _STATUS_CACHE.pop(twid, None)
+            return 'none', False, False, []
 
         append_downloaded(url, title)
-        print(f"   ✅ Saved: {os.path.basename(filepath)}")
+        print(f"   ✅ Saved: {os.path.basename(filepath)} ({os.path.getsize(filepath)/1e6:.1f}MB)")
         _STATUS_CACHE.pop(twid, None)
         return 'video', True, False, [filepath]
 
@@ -381,7 +414,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
 
 # ─────────────────── run loop ────────────────────────────────────────────────
 
-def run_downloads(urls, min_seconds, max_seconds, delay_seconds):
+def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids, downloaded_urls):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     _install_status_cache_patch()
     check_ffmpeg()
@@ -392,7 +425,6 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds):
     if not cookiefile:
         print("⚠️  cookies.txt not found — age-restricted tweets may fail.")
 
-    downloaded_ids, downloaded_urls = load_downloaded_set()
     stats = {'success_video':0,'success_image':0,'skipped':0,'failed':0,'duplicates':0}
     new_files = []
     consecutive_rl = 0
@@ -414,8 +446,10 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds):
             if tid: downloaded_ids.add(tid)
             for fp in fps:
                 if fp and os.path.exists(fp): new_files.append(fp)
-        elif rate_limited: stats['failed'] += 1
-        else: stats['skipped'] += 1
+        elif rate_limited:
+            stats['failed'] += 1
+        else:
+            stats['skipped'] += 1
 
         if rate_limited:
             consecutive_rl += 1
@@ -439,7 +473,7 @@ def get_drive_service():
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
     raw = os.environ.get("GDRIVE_TOKEN_JSON")
-    if not raw: raise RuntimeError("Missing GDRIVE_TOKEN_JSON")
+    if not raw: raise RuntimeError("Missing GDRIVE_TOKEN_JSON env var.")
     info = _json.loads(raw)
     creds = Credentials(
         token=info.get("token"), refresh_token=info["refresh_token"],
@@ -479,43 +513,70 @@ def main():
     parser.add_argument("--delay", default="8")
     args = parser.parse_args()
 
-    folder_name = (
+    folder_name   = (
         "".join(c for c in args.folder_name.strip() if c.isalnum() or c in (' ','-','_')).strip()
         or "downloads"
     )
-    min_seconds  = parse_duration(args.min_duration)
-    max_seconds  = parse_duration(args.max_duration)
+    min_seconds   = parse_duration(args.min_duration)
+    max_seconds   = parse_duration(args.max_duration)
     delay_seconds = parse_duration(args.delay) or 8
 
+    # ── Early exit: no URLs file ─────────────────────────────────────────
     if not os.path.exists(URLS_FILE):
-        print(f"❌ {URLS_FILE} not found."); sys.exit(1)
+        print(f"❌ {URLS_FILE} not found.")
+        sys.exit(1)
 
     with open(URLS_FILE,"r",encoding="utf-8") as f:
         raw_urls = [u.strip() for u in f if u.strip() and not u.startswith('#')]
 
+    # ── Early exit: file is empty ────────────────────────────────────────
+    if not raw_urls:
+        print("✅ urlsnow.txt is empty — nothing to do. Exiting.")
+        sys.exit(0)
+
     urls, dupes = dedupe_preserve_order(raw_urls)
-    if dupes: print(f"🔁 Removed {len(dupes)} duplicate(s) from urlsnow.txt.")
+    if dupes:
+        print(f"🔁 Removed {len(dupes)} duplicate(s) from urlsnow.txt.")
 
-    print(f"Starting: {len(urls)} URL(s) | folder='{folder_name}' | "
-          f"min={min_seconds}s | max={max_seconds}s | delay={delay_seconds}s")
+    # ── Early exit: everything already downloaded ────────────────────────
+    downloaded_ids, downloaded_urls = load_downloaded_set()
+    pending = [
+        u for u in urls
+        if normalize_tweet_url(u) not in downloaded_urls
+        and (not extract_tweet_id(u) or extract_tweet_id(u) not in downloaded_ids)
+    ]
+    if not pending:
+        print("✅ All URLs already downloaded — nothing to do. Exiting.")
+        sys.exit(0)
 
-    stats, new_files = run_downloads(urls, min_seconds, max_seconds, delay_seconds)
+    print(f"\nStarting: {len(pending)} URL(s) pending | folder='{folder_name}' | "
+          f"min={min_seconds}s | max={max_seconds}s | delay={delay_seconds}s | "
+          f"size_limit={SIZE_LIMIT//1_048_576}MB\n")
+
+    stats, new_files = run_downloads(
+        urls, min_seconds, max_seconds, delay_seconds,
+        downloaded_ids, downloaded_urls
+    )
 
     print(f"\n📊 Summary: videos={stats['success_video']} images={stats['success_image']} "
           f"skipped={stats['skipped']} failed={stats['failed']} dupes={stats['duplicates']}")
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
 
+    # ── Early exit: nothing downloaded ──────────────────────────────────
     if not new_files:
-        print("No new files — nothing to upload.")
+        print("✅ No new files downloaded — skipping upload. Exiting.")
         if summary_path:
             with open(summary_path,"a") as f:
-                f.write(f"### Run complete — no new files\n\n"
-                        f"- Videos: {stats['success_video']}\n- Images: {stats['success_image']}\n"
-                        f"- Skipped: {stats['skipped']}\n- Failed: {stats['failed']}\n"
+                f.write(f"### Run complete — nothing to upload\n\n"
+                        f"- Videos: {stats['success_video']}\n"
+                        f"- Images: {stats['success_image']}\n"
+                        f"- Skipped: {stats['skipped']}\n"
+                        f"- Failed: {stats['failed']}\n"
                         f"- Duplicates: {stats['duplicates']}\n")
-        return
+        sys.exit(0)
 
+    # ── Upload ───────────────────────────────────────────────────────────
     print(f"\nUploading {len(new_files)} file(s) to Drive folder '{folder_name}'...")
     service = get_drive_service()
     folder_id, folder_link = create_drive_folder(service, folder_name)
@@ -527,8 +588,10 @@ def main():
     if summary_path:
         with open(summary_path,"a") as f:
             f.write(f"### Run complete\n\n"
-                    f"- Videos: {stats['success_video']}\n- Images: {stats['success_image']}\n"
-                    f"- Skipped: {stats['skipped']}\n- Failed: {stats['failed']}\n"
+                    f"- Videos: {stats['success_video']}\n"
+                    f"- Images: {stats['success_image']}\n"
+                    f"- Skipped: {stats['skipped']}\n"
+                    f"- Failed: {stats['failed']}\n"
                     f"- Duplicates: {stats['duplicates']}\n\n"
                     f"**Drive folder:** [{folder_name}]({folder_link})\n\n"
                     + "\n".join(f"- {n}" for n in uploaded) + "\n")
