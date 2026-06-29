@@ -4,12 +4,11 @@ download_and_upload.py
 =======================
 Reads tweet/X URLs from urlsnow.txt (repo root). For each URL:
     - if the tweet has a video (or animated GIF) -> download it with yt-dlp
-    - if the tweet has photo(s) -> download the full-resolution image(s)
-      directly (yt-dlp itself never returns photo URLs as downloadable
-      formats, only as a "no video" signal -- see NOTE below)
-    - a tweet can have BOTH a video and photos are mutually exclusive on
-      Twitter/X in practice (a tweet is either a video tweet or a photo
-      tweet), but a URL list can freely mix video URLs and photo URLs.
+    - if the tweet has photo(s) instead -> the photo URLs are recovered from
+      the SAME extraction call yt-dlp already makes (no extra request --
+      see NOTE below) and downloaded directly via HTTP GET
+    - a tweet is either a video tweet or a photo tweet on Twitter/X in
+      practice, but a URL list can freely mix video URLs and photo URLs.
 Retries transient failures with backoff + a rate-limit cooldown instead of
 giving up, then uploads everything (videos + images) into a single new
 Google Drive folder.
@@ -19,13 +18,16 @@ Designed to run inside GitHub Actions via workflow_dispatch.
 NOTE on images: yt-dlp's Twitter extractor only ever surfaces *video*
 entries as downloadable "formats" -- photo entries are explicitly filtered
 out internally and the actual photo URLs are discarded before being
-returned to callers. So for image tweets we re-run status extraction
-ourselves (reusing yt-dlp's own TwitterIE._extract_status -- the SAME
-authenticated GraphQL call that already successfully fetches video
-metadata elsewhere in this script) and read the real `media_url_https`
-values directly out of `extended_entities.media`, then download those
-files with a plain HTTP GET. If that call fails, we fall back to
-Twitter's public, no-auth syndication endpoint as a second attempt.
+returned to callers. We get them back WITHOUT any extra network request:
+yt-dlp's TwitterIE._real_extract() already fetches the full tweet status
+(including photo URLs) internally on every call, even for photo-only
+tweets -- it just throws that data away before returning. We monkeypatch
+TwitterIE._extract_status to cache its result as a side effect of the
+SAME extraction call download_one() already makes, then read photo URLs
+straight out of that cached status when there's no video. This avoids
+making a second separate request per tweet, which was triggering
+Twitter/X's guest-token-issuance rate limiting ("Bad guest token" errors)
+when done in a tight loop across many URLs.
 
 Env vars expected (set as GitHub Secrets):
     GDRIVE_CLIENT_ID
@@ -168,54 +170,64 @@ def safe_filename_piece(text, max_len=80):
 
 
 # ───────────────────────── image (photo tweet) engine ─────────────────────────
+#
+# Key design point: making a SEPARATE network call to fetch tweet status
+# (for image URLs) after the main video-extraction call already ran is what
+# was breaking this. Twitter/X's guest-token issuance endpoint
+# (/1.1/guest/activate.json) gets hit once per fresh extractor instance, and
+# doing that twice per tweet -- once for the normal video check, once again
+# for our image fallback -- in a tight loop across many URLs reliably
+# triggers "Bad guest token" / guest-token-exhaustion errors.
+#
+# The fix: yt-dlp's TwitterIE._real_extract() already calls
+# self._extract_status(twid) internally during the NORMAL video-extraction
+# call that download_one() makes anyway. We monkeypatch _extract_status to
+# cache its return value (keyed by tweet id) as a side effect of that single
+# call. When the main call comes back with no video formats, we just read
+# the cached status instead of making any additional request -- zero extra
+# guest tokens, zero extra requests.
 
-def fetch_tweet_media(twid: str):
-    """Returns list of media dicts: {'type': 'photo'|'video'|'animated_gif', 'url': ...}.
+_STATUS_CACHE = {}
 
-    Primary path: reuse yt-dlp's main status-extraction method
-    (TwitterIE._extract_status), the SAME authenticated call that already
-    successfully retrieves video metadata elsewhere in this script. This
-    avoids a second, separate request to a different host (the syndication
-    CDN) that has its own independent rate limits / bot-blocking and may
-    fail even when the main API call succeeds.
 
-    Fallback path: TwitterIE._call_syndication_api(), the public no-auth
-    endpoint yt-dlp itself falls back to. Used only if the primary path
-    raises, in case the main API is itself rate-limited.
-    """
-    from yt_dlp.utils import ExtractorError
+def _install_status_cache_patch():
+    """Monkeypatch TwitterIE._extract_status once per process to cache its
+    result. Safe to call multiple times -- only patches the first time."""
     from yt_dlp.extractor.twitter import TwitterIE
 
-    ydl = yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True})
-    ie = TwitterIE(ydl)
-    ie.initialize()
+    if getattr(TwitterIE, "_status_cache_patched", False):
+        return
 
-    status = None
-    primary_error = None
-    try:
-        status = ie._extract_status(twid)
-    except ExtractorError as e:
-        primary_error = e
-        print(f"   ⚠️ Primary status lookup failed for {twid}: {str(e)[:150]} — trying syndication fallback...")
-        try:
-            status = ie._call_syndication_api(twid)
-        except ExtractorError as e2:
-            print(f"   ⚠️ Syndication fallback also failed for {twid}: {str(e2)[:150]}")
-            raise e2
+    original = TwitterIE._extract_status
 
-    if not status:
-        return []
+    def patched(self, twid, *args, **kwargs):
+        status = original(self, twid, *args, **kwargs)
+        if status:
+            _STATUS_CACHE[twid] = status
+        return status
 
-    media = []
+    TwitterIE._extract_status = patched
+    TwitterIE._status_cache_patched = True
+
+
+def get_photo_media_for_tweet(twid: str):
+    """Returns list of photo URLs for a tweet, using the status object that
+    was already fetched during the normal video-extraction call (no extra
+    network request). Returns [] if nothing is cached yet for this tweet id
+    -- callers should treat that as "couldn't determine, try again" rather
+    than "definitely no photos".
+    """
+    status = _STATUS_CACHE.get(twid)
+    if status is None:
+        return None  # signal: no cached data available
+
+    photos = []
     for detail in (status.get("extended_entities", {}).get("media") or []):
-        mtype = detail.get("type")
-        if mtype == "photo":
+        if detail.get("type") == "photo":
             url = detail.get("media_url_https") or detail.get("media_url")
             if url:
-                media.append({"type": "photo", "url": url})
-        else:
-            media.append({"type": mtype, "url": None})
-    return media
+                photos.append(url)
+    return photos
 
 
 def download_image(url, dest_dir, basename_hint):
@@ -246,34 +258,32 @@ def download_image(url, dest_dir, basename_hint):
 
 
 def download_images_for_tweet(url, twid):
-    """Returns (success: bool, was_rate_limited: bool, filepaths: list[str])."""
-    from yt_dlp.utils import ExtractorError
+    """Returns (success: bool, was_rate_limited: bool, filepaths: list[str]).
 
-    try:
-        media = fetch_tweet_media(twid)
-    except ExtractorError as e:
-        raw = str(e)
-        low = raw.lower()
-        is_rate_limit = any(p in low for p in RATE_LIMIT_PHRASES)
-        print(f"   ⚠️ Could not fetch media metadata for {twid}: {raw[:200]}")
-        return False, is_rate_limit, []
-    except Exception as e:
-        print(f"   ⚠️ Unexpected error fetching media for {twid}: {type(e).__name__}: {str(e)[:200]}")
+    Reads photo URLs from the status object already captured (no extra
+    network request) during the normal video-extraction call that
+    download_one() makes. See module notes above for why this matters.
+    """
+    photos = get_photo_media_for_tweet(twid)
+
+    if photos is None:
+        # Nothing cached -- the monkeypatch didn't fire for some reason
+        # (e.g. yt-dlp internals changed). Don't silently fail forever;
+        # surface this clearly so it's obvious what's wrong.
+        print(f"   ⚠️ No cached status data found for {twid} -- "
+              f"the extraction hook may not be working as expected.")
         return False, False, []
 
-    photos = [m for m in media if m["type"] == "photo"]
     if not photos:
-        types_seen = sorted({m.get("type") for m in media}) if media else []
-        print(f"   ℹ️ Found {len(media)} media item(s) for {twid}, "
-              f"none were photos (types seen: {types_seen or 'none'}).")
+        print(f"   ℹ️ Status data for {twid} contains no photo media.")
         return False, False, []
 
     print(f"   ℹ️ Found {len(photos)} photo(s) for {twid}, downloading...")
     filepaths = []
-    for idx, photo in enumerate(photos, 1):
+    for idx, photo_url in enumerate(photos, 1):
         basename_hint = safe_filename_piece(f"{twid}_img{idx}")
         try:
-            fp = download_image(photo["url"], DOWNLOAD_DIR, basename_hint)
+            fp = download_image(photo_url, DOWNLOAD_DIR, basename_hint)
             filepaths.append(fp)
         except requests.exceptions.RequestException as e:
             print(f"   ⚠️ Failed to fetch image {idx} for {twid}: {str(e)[:150]}")
@@ -290,6 +300,16 @@ def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seco
     filepaths is a list (video downloads produce exactly one entry on success).
     """
     twid = extract_tweet_id(url)
+    try:
+        return _download_one_inner(url, twid, ydl_opts_extract, ydl_opts_download, min_seconds, max_seconds)
+    finally:
+        # Evict this tweet's cached status now that we're done with it, so
+        # _STATUS_CACHE doesn't grow unbounded over a long run.
+        if twid:
+            _STATUS_CACHE.pop(twid, None)
+
+
+def _download_one_inner(url, twid, ydl_opts_extract, ydl_opts_download, min_seconds, max_seconds):
     attempt = 0
     delay = RETRY_BASE_DELAY
     while True:
@@ -315,7 +335,9 @@ def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seco
 
             if not formats:
                 # No video formats -- this is very likely a photo tweet.
-                # Try to pull the actual image(s) via the syndication endpoint.
+                # The status object yt-dlp fetched to determine this was
+                # already captured by the monkeypatch -- no extra request
+                # needed to look at its media list.
                 print(f"🖼️ {title} [{video_id}]: no video formats — checking for image(s)...")
                 if not twid:
                     append_failed(url, "no formats, no tweet id for image fallback")
@@ -391,6 +413,7 @@ def download_one(url, ydl_opts_extract, ydl_opts_download, min_seconds, max_seco
 
 def run_downloads(urls, min_seconds, max_seconds, delay_seconds):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    _install_status_cache_patch()
     cookiefile = COOKIES_PATH if (os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 100) else None
     if not cookiefile:
         print("⚠️ cookies.txt not found — age-restricted tweets may fail.")
