@@ -19,11 +19,13 @@ Designed to run inside GitHub Actions via workflow_dispatch.
 NOTE on images: yt-dlp's Twitter extractor only ever surfaces *video*
 entries as downloadable "formats" -- photo entries are explicitly filtered
 out internally and the actual photo URLs are discarded before being
-returned to callers. So for image tweets we go straight to Twitter's
-public, no-auth syndication endpoint (the same one yt-dlp itself falls
-back to for metadata: https://cdn.syndication.twimg.com/tweet-result) to
-read out the real `media_url_https` values, then download those files
-ourselves with a plain HTTP GET. No login/cookies needed for this part.
+returned to callers. So for image tweets we re-run status extraction
+ourselves (reusing yt-dlp's own TwitterIE._extract_status -- the SAME
+authenticated GraphQL call that already successfully fetches video
+metadata elsewhere in this script) and read the real `media_url_https`
+values directly out of `extended_entities.media`, then download those
+files with a plain HTTP GET. If that call fails, we fall back to
+Twitter's public, no-auth syndication endpoint as a second attempt.
 
 Env vars expected (set as GitHub Secrets):
     GDRIVE_CLIENT_ID
@@ -167,20 +169,40 @@ def safe_filename_piece(text, max_len=80):
 
 # ───────────────────────── image (photo tweet) engine ─────────────────────────
 
-def fetch_tweet_media_via_syndication(twid: str):
+def fetch_tweet_media(twid: str):
     """Returns list of media dicts: {'type': 'photo'|'video'|'animated_gif', 'url': ...}.
 
-    Reuses yt-dlp's own TwitterIE._call_syndication_api(), which talks to
-    Twitter/X's public, unauthenticated syndication endpoint (no login or
-    cookies required). We delegate to yt-dlp's actual current implementation
-    rather than reimplementing the token/request logic ourselves, so this
-    keeps working even if Twitter/X or yt-dlp change the token algorithm.
+    Primary path: reuse yt-dlp's main status-extraction method
+    (TwitterIE._extract_status), the SAME authenticated call that already
+    successfully retrieves video metadata elsewhere in this script. This
+    avoids a second, separate request to a different host (the syndication
+    CDN) that has its own independent rate limits / bot-blocking and may
+    fail even when the main API call succeeds.
+
+    Fallback path: TwitterIE._call_syndication_api(), the public no-auth
+    endpoint yt-dlp itself falls back to. Used only if the primary path
+    raises, in case the main API is itself rate-limited.
     """
+    from yt_dlp.utils import ExtractorError
     from yt_dlp.extractor.twitter import TwitterIE
 
     ydl = yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True})
     ie = TwitterIE(ydl)
-    status = ie._call_syndication_api(twid)
+    ie.initialize()
+
+    status = None
+    primary_error = None
+    try:
+        status = ie._extract_status(twid)
+    except ExtractorError as e:
+        primary_error = e
+        print(f"   ⚠️ Primary status lookup failed for {twid}: {str(e)[:150]} — trying syndication fallback...")
+        try:
+            status = ie._call_syndication_api(twid)
+        except ExtractorError as e2:
+            print(f"   ⚠️ Syndication fallback also failed for {twid}: {str(e2)[:150]}")
+            raise e2
+
     if not status:
         return []
 
@@ -191,8 +213,8 @@ def fetch_tweet_media_via_syndication(twid: str):
             url = detail.get("media_url_https") or detail.get("media_url")
             if url:
                 media.append({"type": "photo", "url": url})
-        # video/animated_gif are left for yt-dlp's normal download path;
-        # we only need photos here.
+        else:
+            media.append({"type": mtype, "url": None})
     return media
 
 
@@ -228,19 +250,25 @@ def download_images_for_tweet(url, twid):
     from yt_dlp.utils import ExtractorError
 
     try:
-        media = fetch_tweet_media_via_syndication(twid)
+        media = fetch_tweet_media(twid)
     except ExtractorError as e:
         raw = str(e)
         low = raw.lower()
         is_rate_limit = any(p in low for p in RATE_LIMIT_PHRASES)
+        print(f"   ⚠️ Could not fetch media metadata for {twid}: {raw[:200]}")
         return False, is_rate_limit, []
-    except Exception:
+    except Exception as e:
+        print(f"   ⚠️ Unexpected error fetching media for {twid}: {type(e).__name__}: {str(e)[:200]}")
         return False, False, []
 
     photos = [m for m in media if m["type"] == "photo"]
     if not photos:
+        types_seen = sorted({m.get("type") for m in media}) if media else []
+        print(f"   ℹ️ Found {len(media)} media item(s) for {twid}, "
+              f"none were photos (types seen: {types_seen or 'none'}).")
         return False, False, []
 
+    print(f"   ℹ️ Found {len(photos)} photo(s) for {twid}, downloading...")
     filepaths = []
     for idx, photo in enumerate(photos, 1):
         basename_hint = safe_filename_piece(f"{twid}_img{idx}")
@@ -248,7 +276,7 @@ def download_images_for_tweet(url, twid):
             fp = download_image(photo["url"], DOWNLOAD_DIR, basename_hint)
             filepaths.append(fp)
         except requests.exceptions.RequestException as e:
-            print(f"   ⚠️ Failed to fetch image {idx} for {twid}: {str(e)[:100]}")
+            print(f"   ⚠️ Failed to fetch image {idx} for {twid}: {str(e)[:150]}")
             continue
 
     return (len(filepaths) > 0), False, filepaths
