@@ -226,7 +226,7 @@ def _ydl_download_opts(cookiefile, max_seconds):
         'no_warnings': True,
     }
     if max_seconds:
-        size_limit   = 80 * 1024 * 1024  # 80 MB hard cap
+        size_limit   = 25 * 1024 * 1024  # 25 MB hard cap
         frag_limit   = int((max_seconds / 2) * 1.25) + 5
         opts['max_filesize'] = size_limit
         opts['max_fragments'] = frag_limit
