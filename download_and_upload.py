@@ -199,49 +199,52 @@ def _ydl_extract_opts(cookiefile):
             'cookiefile':cookiefile,'skip_download':True}
 
 def _ydl_download_opts(cookiefile, max_seconds):
-    """
-    Key fields for enforcing max duration on livestreams:
+    SIZE_LIMIT = 40 * 1024 * 1024  # 40 MB
 
-    max_fragments: Twitter HLS segments ≈ 2 seconds each.
-                   max_seconds/2 * 1.25 headroom + 5 safety = hard fragment cap.
-                   This STOPS the download mid-stream when limit is hit.
+    def _progress_hook(d):
+        if d.get('status') == 'downloading':
+            downloaded = d.get('downloaded_bytes', 0)
+            if downloaded and downloaded > SIZE_LIMIT:
+                raise yt_dlp.utils.DownloadError(
+                    f"Aborted: downloaded {downloaded/1e6:.1f}MB exceeds 40MB limit"
+                )
 
-    max_filesize:  secondary byte cap for normal MP4 tweets.
-
-    match_filter:  evaluated before download starts — rejects if filesize or
-                   duration already known to be out of range.
-    """
     opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': os.path.join(DOWNLOAD_DIR,
-            '%(uploader)s_%(upload_date)s_%(title).60s_[%(id)s].%(ext)s'),
+        'outtmpl': os.path.join(
+            DOWNLOAD_DIR,
+            '%(uploader)s_%(upload_date)s_%(title).60s_[%(id)s].%(ext)s'
+        ),
         'merge_output_format': 'mp4',
         'restrictfilenames': True,
         'ignoreerrors': False,
         'cookiefile': cookiefile,
         'nocheckcertificate': True,
-        'concurrent_fragments': 4,
+        'concurrent_fragments': 1,  # must be 1 so progress_hook byte count is accurate
         'retries': 3,
         'quiet': False,
         'no_warnings': True,
+        'max_filesize': SIZE_LIMIT,
+        'progress_hooks': [_progress_hook],
     }
-    if max_seconds:
-        size_limit   = 25 * 1024 * 1024  # 25 MB hard cap
-        frag_limit   = int((max_seconds / 2) * 1.25) + 5
-        opts['max_filesize'] = size_limit
-        opts['max_fragments'] = frag_limit
-        print(f"   🔒 Limits active: max_fragments={frag_limit}, "
-              f"max_filesize={size_limit//1_000_000}MB")
 
-        def _match_filter(info, *, incomplete):
-            fs = info.get('filesize') or info.get('filesize_approx')
-            if fs and fs > size_limit:
-                return f"filesize {fs/1e6:.0f}MB > limit {size_limit/1e6:.0f}MB"
-            dur = info.get('duration')
-            if dur and int(dur) > max_seconds:
-                return f"duration {int(dur)}s > max {max_seconds}s"
-            return None
-        opts['match_filter'] = _match_filter
+    if max_seconds:
+        frag_limit = int((max_seconds / 2) * 1.25) + 5
+        opts['max_fragments'] = frag_limit
+        print(f"   🔒 Limits: max_fragments={frag_limit}, max_filesize=40MB (enforced via progress hook)")
+    else:
+        print(f"   🔒 Limits: max_filesize=40MB (enforced via progress hook)")
+
+    def _match_filter(info, *, incomplete):
+        fs = info.get('filesize') or info.get('filesize_approx')
+        if fs and fs > SIZE_LIMIT:
+            return f"filesize {fs/1e6:.0f}MB > 40MB limit"
+        dur = info.get('duration')
+        if dur and max_seconds and int(dur) > max_seconds:
+            return f"duration {int(dur)}s > max {max_seconds}s"
+        return None
+
+    opts['match_filter'] = _match_filter
     return opts
 
 
