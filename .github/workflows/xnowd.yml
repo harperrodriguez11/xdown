@@ -1,0 +1,69 @@
+name: Download & Upload (Images or Videos)
+on:
+  workflow_dispatch:
+    inputs:
+      download_mode:
+        description: "Download only Images or only Videos (reads the matching sheet tab)"
+        required: true
+        type: choice
+        options:
+          - images
+          - videos
+        default: videos
+      folder_name:
+        description: "Google Drive folder name to create and upload into"
+        required: true
+      min_duration:
+        description: "Minimum video duration (seconds or mm:ss) — ignored in images mode"
+        required: false
+        default: ""
+      max_duration:
+        description: "Maximum video duration (seconds or mm:ss) — ignored in images mode"
+        required: false
+        default: ""
+      delay_seconds:
+        description: "Delay between downloads (seconds) — raise if you hit rate limits"
+        required: false
+        default: "8"
+      include_urls_in_caption:
+        description: "Keep links (e.g. t.co) in the saved caption"
+        required: false
+        default: "true"
+      include_hashtags_in_caption:
+        description: "Keep #hashtags in the saved caption"
+        required: false
+        default: "false"
+      full_caption:
+        description: "Save the raw, complete caption as-is (overrides the two flags above)"
+        required: false
+        default: "false"
+permissions:
+  contents: read
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        run: sudo apt-get install -y ffmpeg
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Run downloader + uploader
+        env:
+          GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
+        run: |
+          python xnowd.py \
+            --mode "${{ github.event.inputs.download_mode }}" \
+            --folder-name "${{ github.event.inputs.folder_name }}" \
+            --min-duration "${{ github.event.inputs.min_duration }}" \
+            --max-duration "${{ github.event.inputs.max_duration }}" \
+            --delay "${{ github.event.inputs.delay_seconds }}" \
+            --include-urls-in-caption "${{ github.event.inputs.include_urls_in_caption }}" \
+            --include-hashtags-in-caption "${{ github.event.inputs.include_hashtags_in_caption }}" \
+            --full-caption "${{ github.event.inputs.full_caption }}"
