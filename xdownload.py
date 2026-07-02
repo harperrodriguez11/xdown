@@ -2,14 +2,24 @@
 """
 download_and_upload.py
 Reads tweet/X URLs from urlsnow.txt. Downloads images or videos, enforcing
-duration and size limits. Uploads everything (images AND videos) to Drive.
-Runs downloads concurrently for speed. Exits cleanly if nothing to do.
+duration and size limits. Uploads everything (images AND videos) to Drive,
+and logs {file name, caption, tweet url, type} for every uploaded file into
+a Google Sheet (default name: "allmeta") so file names line up 1:1 with the
+tweet's caption. Runs downloads concurrently for speed. Exits cleanly if
+nothing to do.
 
 Filename pattern for every saved file (image or video):
     {title}_{tweet_id}_{upload_date}.{ext}
 If the tweet has no meaningful title (e.g. it's just "wataa", empty, or a
 generic placeholder), the title is omitted:
     {tweet_id}_{upload_date}.{ext}
+
+Caption handling (new):
+    --include-urls-in-caption      true/false   (default: true)
+    --include-hashtags-in-caption  true/false   (default: false)
+    --full-caption                 true/false   (default: false — overrides
+                                                  the two flags above and
+                                                  saves the raw caption as-is)
 """
 
 import os, re, sys, time, subprocess, argparse, threading
@@ -67,6 +77,9 @@ _consecutive_rl  = 0
 
 
 # ─────────────────────────── helpers ────────────────────────────────────────
+
+def _to_bool(s):
+    return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
 
 def extract_tweet_id(url):
     m = re.search(r'/status/(\d+)', url)
@@ -444,10 +457,12 @@ def _ydl_download_opts(cookiefile, max_seconds, base_name):
 
 # ─────────────────── core download ──────────────────────────────────────────
 
-def download_one(url, cookiefile, min_seconds, max_seconds):
-    """Returns (kind, success, was_rate_limited, filepaths)."""
+def download_one(url, cookiefile, min_seconds, max_seconds,
+                  include_urls=True, include_hashtags=False, full_caption=False):
+    """Returns (kind, success, was_rate_limited, filepaths, caption)."""
     twid  = extract_tweet_id(url)
     delay = RETRY_BASE_DELAY
+    caption = ""
 
     for attempt in range(1, MAX_RETRIES + 1):
         _maybe_wait_for_cooldown()
@@ -459,6 +474,9 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
         except Exception as e:
             raw = str(e); low = raw.lower()
             no_media = any(p in low for p in NO_MEDIA_PHRASES)
+            # Best-effort caption capture even on a failed extraction, in case
+            # the status object was cached before the extractor threw.
+            caption = process_caption(get_raw_caption(twid), include_urls, include_hashtags, full_caption) if twid else ""
             # Hard non-transient failure (including "no video") — try image cache before giving up, no retry
             if no_media or not any(p in low for p in TRANSIENT_PHRASES):
                 if no_media:
@@ -470,14 +488,14 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                     if ok:
                         append_downloaded(url, f"[{len(fps)} image(s)]")
                         _pop_status_cache(twid)
-                        return 'image', True, False, fps
+                        return 'image', True, False, fps, caption
                 append_failed(url, raw[:200])
                 _pop_status_cache(twid)
-                return 'none', False, False, []
+                return 'none', False, False, [], ""
             if attempt >= MAX_RETRIES:
                 append_failed(url, raw[:200])
                 _pop_status_cache(twid)
-                return 'none', False, True, []
+                return 'none', False, True, [], ""
             print(f"   ⚠️  Attempt {attempt}/{MAX_RETRIES}: {raw[:80]} — retry in {delay}s")
             time.sleep(delay); delay = min(delay*2, RETRY_MAX_DELAY); continue
 
@@ -487,6 +505,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
         uploader    = ((info or {}).get('uploader') or (info or {}).get('uploader_id')) if info else None
         base_name   = build_base_name(title, twid or video_id, upload_date, uploader)
         label       = f"{title[:55]} [{video_id}]"
+        caption     = process_caption(get_raw_caption(twid), include_urls, include_hashtags, full_caption) if twid else ""
 
         # ── 2. Photo-only check (no video attempt at all) ────────────────
         if twid:
@@ -496,7 +515,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 ok, fps = download_images_for_tweet(url, twid, title, upload_date, uploader)
                 if ok: append_downloaded(url, f"{title} [{len(fps)} image(s)]")
                 _pop_status_cache(twid)
-                return ('image', True, False, fps) if ok else ('none', False, False, [])
+                return ('image', True, False, fps, caption) if ok else ('none', False, False, [], "")
 
         # ── 3. No video formats — try image fallback ─────────────────────
         if not info or not info.get('formats'):
@@ -506,10 +525,10 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 if ok:
                     append_downloaded(url, f"{title} [{len(fps)} image(s)]")
                     _pop_status_cache(twid)
-                    return 'image', True, False, fps
+                    return 'image', True, False, fps, caption
             append_failed(url, "no formats, no images")
             _pop_status_cache(twid)
-            return 'none', False, False, []
+            return 'none', False, False, [], ""
 
         # ── 4. Metadata duration check (fast path) ───────────────────────
         duration = info.get('duration')
@@ -517,7 +536,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             if not _duration_ok(duration, min_seconds, max_seconds, label):
                 append_failed(url, f"duration {int(duration)}s out of range")
                 _pop_status_cache(twid)
-                return 'none', False, False, []
+                return 'none', False, False, [], ""
             print(f"   ⬇️  Downloading ({int(duration)}s): {label}")
         else:
             if max_seconds:
@@ -536,7 +555,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 print(f"   ⏩ Rejected by filter before download.")
                 append_failed(url, "rejected by match_filter")
                 _pop_status_cache(twid)
-                return 'none', False, False, []
+                return 'none', False, False, [], ""
 
             filepath = ydl_dl.prepare_filename(result)
             mp4 = os.path.splitext(filepath)[0] + ".mp4"
@@ -551,7 +570,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             print(f"   ⏩ Aborted: fragment limit reached.")
             append_failed(url, "fragment limit reached — too long/large")
             _pop_status_cache(twid)
-            return 'none', False, False, []
+            return 'none', False, False, [], ""
 
         except Exception as e:
             raw = str(e); low = raw.lower()
@@ -561,7 +580,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 print(f"   ⏩ Skipping permanently (size/duration limit): {raw[:120]}")
                 append_failed(url, raw[:120])
                 _pop_status_cache(twid)
-                return 'none', False, False, []
+                return 'none', False, False, [], ""
 
             # Deterministic "no video" error — fail immediately, NO retry
             if any(p in low for p in NO_MEDIA_PHRASES):
@@ -571,10 +590,10 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                     if ok:
                         append_downloaded(url, f"{title} [{len(fps)} image(s)]")
                         _pop_status_cache(twid)
-                        return 'image', True, False, fps
+                        return 'image', True, False, fps, caption
                 append_failed(url, raw[:200])
                 _pop_status_cache(twid)
-                return 'none', False, False, []
+                return 'none', False, False, [], ""
 
             # Transient error — retry
             is_transient = any(p in low for p in TRANSIENT_PHRASES)
@@ -584,7 +603,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
 
             append_failed(url, raw[:200])
             _pop_status_cache(twid)
-            return 'none', False, is_transient, []
+            return 'none', False, is_transient, [], ""
 
         # ── 6. ffprobe post-download check ───────────────────────────────
         if os.path.exists(filepath):
@@ -596,7 +615,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                     os.remove(filepath)
                     append_failed(url, f"actual duration {int(actual)}s out of range")
                     _pop_status_cache(twid)
-                    return 'none', False, False, []
+                    return 'none', False, False, [], ""
             else:
                 print(f"   ⚠️  ffprobe couldn't read duration — keeping file.")
 
@@ -607,26 +626,27 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 os.remove(filepath)
                 append_failed(url, f"file {file_size/1e6:.1f}MB > size limit")
                 _pop_status_cache(twid)
-                return 'none', False, False, []
+                return 'none', False, False, [], ""
         else:
             print(f"   ⚠️  File not found after download: {filepath}")
             append_failed(url, "file missing after download")
             _pop_status_cache(twid)
-            return 'none', False, False, []
+            return 'none', False, False, [], ""
 
         append_downloaded(url, title)
         print(f"   ✅ Saved: {os.path.basename(filepath)} ({os.path.getsize(filepath)/1e6:.1f}MB)")
         _pop_status_cache(twid)
-        return 'video', True, False, [filepath]
+        return 'video', True, False, [filepath], caption
 
     append_failed(url, "max retries exceeded")
     _pop_status_cache(twid)
-    return 'none', False, True, []
+    return 'none', False, True, [], ""
 
 
 # ─────────────────── run loop (concurrent) ───────────────────────────────────
 
-def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids, downloaded_urls, concurrency=3):
+def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids, downloaded_urls,
+                   concurrency=3, include_urls=True, include_hashtags=False, full_caption=False):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     _install_status_cache_patch()
     check_ffmpeg()
@@ -639,6 +659,7 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids,
 
     stats = {'success_video':0,'success_image':0,'skipped':0,'failed':0,'duplicates':0}
     new_files = []
+    file_meta = []   # [{filepath, name, caption, url, kind}, ...] — one entry per saved file
     stats_lock = threading.Lock()
     sets_lock  = threading.Lock()
     files_lock = threading.Lock()
@@ -653,7 +674,7 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids,
         pending.append(url)
 
     if not pending:
-        return stats, new_files
+        return stats, new_files, file_meta
 
     print(f"\n🚀 Processing {len(pending)} URL(s) with concurrency={concurrency}...")
 
@@ -664,7 +685,10 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids,
             time.sleep(idx * stagger)
         tid = extract_tweet_id(url)
         print(f"\n[{idx+1}/{len(pending)}] {url}")
-        kind, ok, rate_limited, fps = download_one(url, cookiefile, min_seconds, max_seconds)
+        kind, ok, rate_limited, fps, caption = download_one(
+            url, cookiefile, min_seconds, max_seconds,
+            include_urls=include_urls, include_hashtags=include_hashtags, full_caption=full_caption
+        )
 
         with stats_lock:
             if ok:
@@ -680,7 +704,15 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids,
                 if tid: downloaded_ids.add(tid)
             with files_lock:
                 for fp in fps:
-                    if fp and os.path.exists(fp): new_files.append(fp)
+                    if fp and os.path.exists(fp):
+                        new_files.append(fp)
+                        file_meta.append({
+                            'filepath': fp,
+                            'name': os.path.basename(fp),
+                            'caption': caption,
+                            'url': url,
+                            'kind': kind,
+                        })
             _register_success_event()
 
         if rate_limited:
@@ -693,18 +725,17 @@ def run_downloads(urls, min_seconds, max_seconds, delay_seconds, downloaded_ids,
             if exc:
                 print(f"   ⚠️  Worker crashed: {exc}")
 
-    return stats, new_files
+    return stats, new_files, file_meta
 
 
 # ─────────────────── Google Drive ────────────────────────────────────────────
 
 _thread_local = threading.local()
 
-def get_drive_service():
+def _load_google_creds():
     import json as _json
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
     raw = os.environ.get("GDRIVE_TOKEN_JSON")
     if not raw: raise RuntimeError("Missing GDRIVE_TOKEN_JSON env var.")
     info = _json.loads(raw)
@@ -715,7 +746,24 @@ def get_drive_service():
         scopes=info.get("scopes",["https://www.googleapis.com/auth/drive"]),
     )
     creds.refresh(Request())
-    return build("drive","v3",credentials=creds, cache_discovery=False)
+    return creds
+
+def get_drive_service():
+    from googleapiclient.discovery import build
+    return build("drive","v3",credentials=_load_google_creds(), cache_discovery=False)
+
+def get_sheets_service():
+    """
+    Reuses the same GDRIVE_TOKEN_JSON credentials as Drive. This only works if
+    the token was authorized with a scope that also covers Sheets — either
+    'https://www.googleapis.com/auth/spreadsheets' explicitly, or the broad
+    'https://www.googleapis.com/auth/drive' scope (which covers Sheets too,
+    since Sheets are just Drive files). If your existing token only has a
+    narrower Drive scope (e.g. drive.file) and sheet writes start failing with
+    a 403, re-run the OAuth flow adding the spreadsheets scope.
+    """
+    from googleapiclient.discovery import build
+    return build("sheets","v4",credentials=_load_google_creds(), cache_discovery=False)
 
 def _thread_drive_service():
     """A shared googleapiclient service object is NOT safe to call from
@@ -731,7 +779,8 @@ def create_drive_folder(service, folder_name):
 
 def upload_files_to_folder(folder_id, filepaths, concurrency=4):
     """Uploads every file (images AND videos) to the given Drive folder,
-    in parallel. A failure on one file no longer blocks the rest."""
+    in parallel. A failure on one file no longer blocks the rest.
+    Returns (uploaded_names: set[str], failed: list[(name, error)])."""
     from googleapiclient.http import MediaFileUpload
 
     uploaded, failed = [], []
@@ -762,7 +811,47 @@ def upload_files_to_folder(folder_id, filepaths, concurrency=4):
         for n, e in failed:
             print(f"   - {n}: {e}")
 
-    return uploaded, failed
+    return set(uploaded), failed
+
+
+# ─────────────────── Google Sheets metadata log ──────────────────────────────
+
+SHEET_TAB       = "Sheet1"
+SHEET_HEADER    = ["File Name", "Caption", "Tweet URL", "Type"]
+
+def find_or_create_spreadsheet(drive_service, sheets_service, name):
+    """Reuses an existing spreadsheet with this exact name if one exists
+    (so repeated workflow runs keep appending to the same 'allmeta' sheet),
+    otherwise creates a new one."""
+    q = f"name='{name}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
+    res = drive_service.files().list(q=q, fields="files(id, name, webViewLink)", pageSize=1).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"], files[0].get("webViewLink")
+    spreadsheet = sheets_service.spreadsheets().create(
+        body={"properties": {"title": name}},
+        fields="spreadsheetId, spreadsheetUrl"
+    ).execute()
+    return spreadsheet["spreadsheetId"], spreadsheet.get("spreadsheetUrl")
+
+def ensure_sheet_header(sheets_service, spreadsheet_id):
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=f"{SHEET_TAB}!A1:D1"
+    ).execute()
+    if not result.get("values"):
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=f"{SHEET_TAB}!A1",
+            valueInputOption="RAW",
+            body={"values": [SHEET_HEADER]}
+        ).execute()
+
+def append_rows_to_sheet(sheets_service, spreadsheet_id, rows):
+    if not rows: return
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id, range=f"{SHEET_TAB}!A1",
+        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+        body={"values": rows}
+    ).execute()
 
 
 # ─────────────────── main ────────────────────────────────────────────────────
@@ -778,6 +867,14 @@ def main():
                          help="How many tweets to download in parallel.")
     parser.add_argument("--upload-concurrency", default="4",
                          help="How many files to upload to Drive in parallel.")
+    parser.add_argument("--sheet-name", default="allmeta",
+                         help="Google Sheet to log {file name, caption, url, type} into. Reused across runs if it already exists.")
+    parser.add_argument("--include-urls-in-caption", default="true",
+                         help="true/false — keep links (e.g. t.co) in the saved caption. Default: true.")
+    parser.add_argument("--include-hashtags-in-caption", default="false",
+                         help="true/false — keep #hashtags in the saved caption. Default: false.")
+    parser.add_argument("--full-caption", default="false",
+                         help="true/false — save the raw, complete caption as-is, ignoring the two flags above. Default: false.")
     args = parser.parse_args()
 
     folder_name   = (
@@ -789,6 +886,15 @@ def main():
     delay_seconds        = parse_duration(args.delay) or 2
     concurrency          = max(1, int(parse_duration(args.concurrency) or 3))
     upload_concurrency   = max(1, int(parse_duration(args.upload_concurrency) or 4))
+
+    include_urls      = _to_bool(args.include_urls_in_caption)
+    include_hashtags  = _to_bool(args.include_hashtags_in_caption)
+    full_caption      = _to_bool(args.full_caption)
+    sheet_name        = args.sheet_name.strip() or "allmeta"
+
+    caption_mode = "FULL (raw, unmodified)" if full_caption else \
+        f"urls={'on' if include_urls else 'off'}, hashtags={'on' if include_hashtags else 'off'}"
+    print(f"📝 Caption mode: {caption_mode} | Sheet: '{sheet_name}'")
 
     # ── Early exit: no URLs file ─────────────────────────────────────────
     if not os.path.exists(URLS_FILE):
@@ -823,9 +929,10 @@ def main():
           f"concurrency={concurrency} | size_limit={SIZE_LIMIT//1_048_576}MB\n")
 
     t0 = time.time()
-    stats, new_files = run_downloads(
+    stats, new_files, file_meta = run_downloads(
         urls, min_seconds, max_seconds, delay_seconds,
-        downloaded_ids, downloaded_urls, concurrency=concurrency
+        downloaded_ids, downloaded_urls, concurrency=concurrency,
+        include_urls=include_urls, include_hashtags=include_hashtags, full_caption=full_caption
     )
     elapsed = time.time() - t0
 
@@ -852,12 +959,31 @@ def main():
     print(f"\nUploading {len(new_files)} file(s) to Drive folder '{folder_name}'...")
     service = get_drive_service()
     folder_id, folder_link = create_drive_folder(service, folder_name)
-    uploaded, failed_uploads = upload_files_to_folder(folder_id, new_files, concurrency=upload_concurrency)
+    uploaded_names, failed_uploads = upload_files_to_folder(folder_id, new_files, concurrency=upload_concurrency)
 
-    print(f"\n✅ Uploaded {len(uploaded)}/{len(new_files)} file(s) to '{folder_name}'.")
+    print(f"\n✅ Uploaded {len(uploaded_names)}/{len(new_files)} file(s) to '{folder_name}'.")
     if failed_uploads:
         print(f"⚠️  {len(failed_uploads)} file(s) failed to upload — see log above.")
     if folder_link: print(f"🔗 {folder_link}")
+
+    # ── Log file name + caption + url + type into the Google Sheet ────────
+    sheet_link = None
+    rows_logged = 0
+    try:
+        sheets_service = get_sheets_service()
+        sheet_id, sheet_link = find_or_create_spreadsheet(service, sheets_service, sheet_name)
+        ensure_sheet_header(sheets_service, sheet_id)
+        rows = [
+            [m['name'], m['caption'], m['url'], m['kind']]
+            for m in file_meta
+            if m['name'] in uploaded_names
+        ]
+        append_rows_to_sheet(sheets_service, sheet_id, rows)
+        rows_logged = len(rows)
+        print(f"\n📝 Logged {rows_logged} row(s) to sheet '{sheet_name}'.")
+        if sheet_link: print(f"🔗 {sheet_link}")
+    except Exception as e:
+        print(f"\n⚠️  Google Sheet logging failed: {str(e)[:200]}")
 
     if summary_path:
         with open(summary_path,"a") as f:
@@ -867,9 +993,12 @@ def main():
                     f"- Skipped: {stats['skipped']}\n"
                     f"- Failed: {stats['failed']}\n"
                     f"- Duplicates: {stats['duplicates']}\n"
-                    f"- Uploaded: {len(uploaded)}/{len(new_files)}\n\n"
+                    f"- Uploaded: {len(uploaded_names)}/{len(new_files)}\n"
+                    f"- Sheet rows logged: {rows_logged}\n\n"
                     f"**Drive folder:** [{folder_name}]({folder_link})\n\n"
-                    + "\n".join(f"- {n}" for n in uploaded) + "\n")
+                    + "\n".join(f"- {n}" for n in sorted(uploaded_names)) + "\n")
+            if sheet_link:
+                f.write(f"\n**Metadata sheet:** [{sheet_name}]({sheet_link})\n")
             if failed_uploads:
                 f.write("\n**Upload failures:**\n" + "\n".join(f"- {n}: {e}" for n, e in failed_uploads) + "\n")
 
