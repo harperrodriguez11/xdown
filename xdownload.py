@@ -127,13 +127,36 @@ def normalize_date_str(upload_date):
         return str(upload_date)
     return datetime.now().strftime("%Y%m%d")
 
-def build_base_name(title, twid, upload_date):
+def strip_uploader_prefix(title, uploader):
+    """
+    yt-dlp's Twitter extractor formats title as '{uploader} - {tweet text}'.
+    We only want the tweet text in the filename, never the account name/handle.
+    """
+    if not title:
+        return title
+    title = title.strip()
+    if uploader:
+        for candidate in (uploader, uploader.lstrip('@')):
+            prefix = f"{candidate} - "
+            if title.lower().startswith(prefix.lower()):
+                title = title[len(prefix):].strip()
+                break
+    # Fallback: also strip a generic "<handle-like-token> - " prefix even if
+    # we don't have an explicit uploader field to compare against.
+    m = re.match(r'^[\w.]{1,30}\s*-\s+(.*)$', title)
+    if m and m.group(1):
+        title = m.group(1).strip()
+    return title
+
+def build_base_name(title, twid, upload_date, uploader=None):
     """
     Produces: {title}_{id}_{date}   or   {id}_{date}  when the title is
-    missing / generic (e.g. 'wataa').
+    missing / generic (e.g. 'wataa') or turns out to just be the uploader's
+    username/handle with nothing else.
     """
     date_str = normalize_date_str(upload_date)
-    slug = safe_filename_piece(title, max_len=60, default="")
+    clean_title = strip_uploader_prefix(title, uploader)
+    slug = safe_filename_piece(clean_title, max_len=100, default="")
     check = slug.lower().replace("_", "")
     if not slug or len(check) <= 2 or check in GENERIC_TITLE_PLACEHOLDERS:
         return f"{twid}_{date_str}"
@@ -262,14 +285,14 @@ def download_image(url, dest_dir, base_name, idx, total):
             if chunk: f.write(chunk)
     return fp
 
-def download_images_for_tweet(url, twid, title=None, upload_date=None):
+def download_images_for_tweet(url, twid, title=None, upload_date=None, uploader=None):
     photos, _ = _get_media_from_status(twid)
     if photos is None:
         print(f"   ⚠️  No cached status for {twid}."); return False, []
     if not photos:
         print(f"   ℹ️  No photo media for {twid}."); return False, []
     print(f"   🖼️  {len(photos)} photo(s) found, downloading...")
-    base_name = build_base_name(title, twid, upload_date)
+    base_name = build_base_name(title, twid, upload_date, uploader)
     fps = []
     for idx, photo_url in enumerate(photos, 1):
         try:
@@ -289,7 +312,7 @@ def _ydl_extract_opts(cookiefile):
         'skip_download': True,
     }
 
-def _ydl_download_opts(cookiefile, max_seconds, twid):
+def _ydl_download_opts(cookiefile, max_seconds, base_name):
     """
     Three layers of size/duration enforcement:
     1. progress_hook  — fires every chunk, aborts when downloaded bytes > SIZE_LIMIT
@@ -297,9 +320,8 @@ def _ydl_download_opts(cookiefile, max_seconds, twid):
     3. match_filter   — rejects before download if filesize/duration known upfront
     concurrent_fragments=1 is required so progress_hook byte count is accurate.
 
-    outtmpl uses the tweet id (unique per download) so concurrent workers never
-    collide; the final descriptive filename is applied by a rename step after
-    all validation passes.
+    outtmpl uses the final {title}_{id}_{date} name directly, so the file is
+    saved with the right name from the start — no rename step afterward.
     """
 
     def _progress_hook(d):
@@ -312,7 +334,7 @@ def _ydl_download_opts(cookiefile, max_seconds, twid):
 
     opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': os.path.join(DOWNLOAD_DIR, f'_tmp_{twid or "%(id)s"}.%(ext)s'),
+        'outtmpl': os.path.join(DOWNLOAD_DIR, f'{base_name}.%(ext)s'),
         'merge_output_format': 'mp4',
         'restrictfilenames': True,
         'ignoreerrors': False,
@@ -384,6 +406,8 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
         title       = (info or {}).get('title', url) if info else url
         video_id    = (info or {}).get('id', 'unknown') if info else 'unknown'
         upload_date = (info or {}).get('upload_date') if info else None
+        uploader    = ((info or {}).get('uploader') or (info or {}).get('uploader_id')) if info else None
+        base_name   = build_base_name(title, twid or video_id, upload_date, uploader)
         label       = f"{title[:55]} [{video_id}]"
 
         # ── 2. Photo-only check (no video attempt at all) ────────────────
@@ -391,7 +415,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             photos, has_video = _get_media_from_status(twid)
             if photos and not has_video:
                 print(f"   🖼️  Photo-only tweet: {label}")
-                ok, fps = download_images_for_tweet(url, twid, title, upload_date)
+                ok, fps = download_images_for_tweet(url, twid, title, upload_date, uploader)
                 if ok: append_downloaded(url, f"{title} [{len(fps)} image(s)]")
                 _pop_status_cache(twid)
                 return ('image', True, False, fps) if ok else ('none', False, False, [])
@@ -400,7 +424,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
         if not info or not info.get('formats'):
             print(f"   ℹ️  No video formats — trying cached images...")
             if twid:
-                ok, fps = download_images_for_tweet(url, twid, title, upload_date)
+                ok, fps = download_images_for_tweet(url, twid, title, upload_date, uploader)
                 if ok:
                     append_downloaded(url, f"{title} [{len(fps)} image(s)]")
                     _pop_status_cache(twid)
@@ -425,7 +449,7 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             print(f"   ⬇️  Downloading (duration unknown): {label}")
 
         # ── 5. Download ──────────────────────────────────────────────────
-        dl_opts = _ydl_download_opts(cookiefile, max_seconds, twid or video_id)
+        dl_opts = _ydl_download_opts(cookiefile, max_seconds, base_name)
         try:
             with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
                 result = ydl_dl.extract_info(url, download=True)
@@ -440,10 +464,9 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             mp4 = os.path.splitext(filepath)[0] + ".mp4"
             if os.path.exists(mp4): filepath = mp4
             if not os.path.exists(filepath):
-                # fall back to locating the temp file by its unique tweet-id prefix
-                prefix = f"_tmp_{twid or video_id}"
+                # fall back to locating the file by its final base name
                 for fn in os.listdir(DOWNLOAD_DIR):
-                    if fn.startswith(prefix):
+                    if fn.startswith(base_name + "."):
                         filepath = os.path.join(DOWNLOAD_DIR, fn); break
 
         except yt_dlp.utils.MaxDownloadsReached:
@@ -499,17 +522,6 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             append_failed(url, "file missing after download")
             _pop_status_cache(twid)
             return 'none', False, False, []
-
-        # ── 7. Rename to the final title_id_date pattern ─────────────────
-        base_name = build_base_name(title, twid or video_id, upload_date)
-        ext = os.path.splitext(filepath)[1].lstrip('.') or "mp4"
-        final_fp = unique_path(DOWNLOAD_DIR, base_name, ext)
-        try:
-            os.remove(final_fp)  # unique_path reserves an empty placeholder file
-            os.rename(filepath, final_fp)
-            filepath = final_fp
-        except OSError as e:
-            print(f"   ⚠️  Rename failed ({e}) — keeping original filename.")
 
         append_downloaded(url, title)
         print(f"   ✅ Saved: {os.path.basename(filepath)} ({os.path.getsize(filepath)/1e6:.1f}MB)")
