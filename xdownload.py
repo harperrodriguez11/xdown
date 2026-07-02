@@ -42,6 +42,14 @@ RATE_LIMIT_PHRASES = [
 TRANSIENT_PHRASES = RATE_LIMIT_PHRASES + ['login','log in','auth','age','500','network']
 LIMIT_PHRASES     = ['sizelimit','filesize','exceeds','fragment limit','max_fragments']
 
+# Deterministic "there is nothing to download here" errors — never worth
+# retrying, since the tweet's content won't change between attempts.
+NO_MEDIA_PHRASES  = [
+    'no video could be found', 'no video formats found', 'no media found',
+    "doesn't contain any video", "does not contain any video",
+    'no video in this tweet', 'no video url found',
+]
+
 # Titles that carry no real meaning and should be dropped from the filename
 GENERIC_TITLE_PLACEHOLDERS = {
     "wataa", "video", "media", "twitter", "x", "tweet", "untitled",
@@ -148,15 +156,30 @@ def strip_uploader_prefix(title, uploader):
         title = m.group(1).strip()
     return title
 
-def build_base_name(title, twid, upload_date, uploader=None):
+# Real filesystems (ext4, APFS, NTFS, etc.) hard-cap filenames at 255 bytes.
+# This is not a stylistic choice — going over it makes the save fail outright.
+FS_MAX_FILENAME_BYTES = 255
+
+def build_base_name(title, twid, upload_date, uploader=None, reserved_suffix_len=0):
     """
     Produces: {title}_{id}_{date}   or   {id}_{date}  when the title is
     missing / generic (e.g. 'wataa') or turns out to just be the uploader's
     username/handle with nothing else.
+
+    The title is kept in FULL — no arbitrary truncation. It's only trimmed
+    if the complete filename would exceed the filesystem's actual 255-byte
+    limit (reserved_suffix_len accounts for things like "_img12.jpeg" that
+    get appended after this base name for multi-photo tweets).
     """
     date_str = normalize_date_str(upload_date)
     clean_title = strip_uploader_prefix(title, uploader)
-    slug = safe_filename_piece(clean_title, max_len=100, default="")
+
+    # Budget: 255 bytes total, minus "_id_date", minus room for an extension
+    # and any extra suffix (e.g. "_img12"), with a little headroom.
+    fixed_len = len(f"_{twid}_{date_str}") + reserved_suffix_len + 10
+    title_budget = max(FS_MAX_FILENAME_BYTES - fixed_len, 20)
+
+    slug = safe_filename_piece(clean_title, max_len=title_budget, default="")
     check = slug.lower().replace("_", "")
     if not slug or len(check) <= 2 or check in GENERIC_TITLE_PLACEHOLDERS:
         return f"{twid}_{date_str}"
@@ -265,6 +288,53 @@ def _pop_status_cache(twid):
     with _cache_lock:
         _STATUS_CACHE.pop(twid, None)
 
+def get_raw_caption(twid):
+    """Pulls the full, untruncated tweet text out of the cached status object.
+    Tries several known field shapes since Twitter/X's API response format
+    has changed over time (legacy v1.1-style vs newer GraphQL-style)."""
+    if not twid:
+        return ""
+    with _cache_lock:
+        status = _STATUS_CACHE.get(twid)
+    if not status:
+        return ""
+    candidates = (
+        lambda s: s.get('full_text'),
+        lambda s: s.get('text'),
+        lambda s: (s.get('legacy') or {}).get('full_text'),
+        lambda s: (s.get('legacy') or {}).get('text'),
+        lambda s: (((s.get('note_tweet') or {}).get('note_tweet_results') or {}).get('result') or {}).get('text'),
+    )
+    for get in candidates:
+        try:
+            val = get(status)
+            if val:
+                return val
+        except Exception:
+            continue
+    return ""
+
+_URL_REGEX     = re.compile(r'https?://\S+')
+_HASHTAG_REGEX = re.compile(r'(?<!\w)#\w+')
+
+def process_caption(raw_text, include_urls=True, include_hashtags=False, full_caption=False):
+    """
+    Cleans up a raw tweet caption according to the chosen options:
+      - full_caption=True   -> returned exactly as-is, ignoring the other two flags
+      - include_urls=False  -> strips any http(s) links (e.g. t.co links)
+      - include_hashtags=False -> strips #hashtag tokens
+    """
+    text = (raw_text or "").strip()
+    if not text or full_caption:
+        return text
+    if not include_urls:
+        text = _URL_REGEX.sub('', text)
+    if not include_hashtags:
+        text = _HASHTAG_REGEX.sub('', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n\s*\n+', '\n', text)
+    return text.strip()
+
 
 # ─────────────────── image download ─────────────────────────────────────────
 
@@ -292,7 +362,9 @@ def download_images_for_tweet(url, twid, title=None, upload_date=None, uploader=
     if not photos:
         print(f"   ℹ️  No photo media for {twid}."); return False, []
     print(f"   🖼️  {len(photos)} photo(s) found, downloading...")
-    base_name = build_base_name(title, twid, upload_date, uploader)
+    # multi-photo tweets append "_imgNN" after the base name — reserve room for that
+    suffix_len = len(f"_img{len(photos)}") if len(photos) > 1 else 0
+    base_name = build_base_name(title, twid, upload_date, uploader, reserved_suffix_len=suffix_len)
     fps = []
     for idx, photo_url in enumerate(photos, 1):
         try:
@@ -310,6 +382,7 @@ def _ydl_extract_opts(cookiefile):
         'quiet': True, 'no_warnings': True,
         'nocheckcertificate': True, 'cookiefile': cookiefile,
         'skip_download': True,
+        'retries': 0, 'extractor_retries': 0,
     }
 
 def _ydl_download_opts(cookiefile, max_seconds, base_name):
@@ -341,7 +414,8 @@ def _ydl_download_opts(cookiefile, max_seconds, base_name):
         'cookiefile': cookiefile,
         'nocheckcertificate': True,
         'concurrent_fragments': 1,   # must be 1 for accurate progress_hook byte count
-        'retries': 3,
+        'retries': 3,                # fragment/network retries — useful for real download flakiness
+        'extractor_retries': 0,      # no internal retry on deterministic extractor errors (e.g. "no video")
         'quiet': False,
         'no_warnings': True,
         'max_filesize': SIZE_LIMIT,
@@ -384,9 +458,13 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
                 info = ydl.extract_info(url, download=False)
         except Exception as e:
             raw = str(e); low = raw.lower()
-            # Hard non-transient failure — try image cache before giving up
-            if not any(p in low for p in TRANSIENT_PHRASES):
-                print(f"   ⚠️  extract_info failed: {raw[:120]}")
+            no_media = any(p in low for p in NO_MEDIA_PHRASES)
+            # Hard non-transient failure (including "no video") — try image cache before giving up, no retry
+            if no_media or not any(p in low for p in TRANSIENT_PHRASES):
+                if no_media:
+                    print(f"   ℹ️  No video in tweet — checking for photos, then skipping.")
+                else:
+                    print(f"   ⚠️  extract_info failed: {raw[:120]}")
                 if twid:
                     ok, fps = download_images_for_tweet(url, twid)
                     if ok:
@@ -482,6 +560,19 @@ def download_one(url, cookiefile, min_seconds, max_seconds):
             if any(k in low for k in LIMIT_PHRASES):
                 print(f"   ⏩ Skipping permanently (size/duration limit): {raw[:120]}")
                 append_failed(url, raw[:120])
+                _pop_status_cache(twid)
+                return 'none', False, False, []
+
+            # Deterministic "no video" error — fail immediately, NO retry
+            if any(p in low for p in NO_MEDIA_PHRASES):
+                print(f"   ℹ️  No video available — checking for photos, then skipping.")
+                if twid:
+                    ok, fps = download_images_for_tweet(url, twid, title, upload_date, uploader)
+                    if ok:
+                        append_downloaded(url, f"{title} [{len(fps)} image(s)]")
+                        _pop_status_cache(twid)
+                        return 'image', True, False, fps
+                append_failed(url, raw[:200])
                 _pop_status_cache(twid)
                 return 'none', False, False, []
 
