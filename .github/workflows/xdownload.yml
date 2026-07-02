@@ -1,0 +1,65 @@
+name: Download & Upload Videos
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder_name:
+        description: "Google Drive folder name to create and upload into"
+        required: true
+      min_duration:
+        description: "Minimum video duration (seconds or mm:ss) — leave blank for no minimum"
+        required: false
+        default: ""
+      max_duration:
+        description: "Maximum video duration (seconds or mm:ss) — leave blank for no maximum"
+        required: false
+        default: ""
+      delay_seconds:
+        description: "Delay between downloads (seconds) — raise if you hit rate limits"
+        required: false
+        default: "8"
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ensure log files exist
+        run: touch downloaded_videos.txt failed_videos.txt
+
+      - name: Run downloader + uploader
+        env:
+          GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
+        run: |
+          python xdownload.py \
+            --folder-name "${{ github.event.inputs.folder_name }}" \
+            --min-duration "${{ github.event.inputs.min_duration }}" \
+            --max-duration "${{ github.event.inputs.max_duration }}" \
+            --delay "${{ github.event.inputs.delay_seconds }}"
+
+      - name: Commit progress log (always, even on failure/cancellation)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloaded_videos.txt failed_videos.txt
+          git diff --cached --quiet || git commit -m "Update download log [skip ci]"
+          git push
