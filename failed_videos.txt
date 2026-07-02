@@ -87,3 +87,9 @@ https://x.com/Mari_bunnygirl/status/2072237614527140303	ERROR: [twitter] 2072237
 https://x.com/angeldemonxxx_5/status/1983590320341467473	file missing after download	2026-07-02 05:08:26
 https://x.com/yonixyow/status/2069752434801402331	file missing after download	2026-07-02 05:09:20
 https://x.com/maker_milly/status/2019527958633836868	file missing after download	2026-07-02 05:11:32
+https://x.com/msmulaniii/status/2049664574433947767	file missing after download	2026-07-02 05:31:22
+https://x.com/Nellyvanderwood/status/2066188724740804705	file missing after download	2026-07-02 05:31:22
+https://x.com/Mari_bunnygirl/status/2072237614527140303	ERROR: [twitter] 2072237614527140303: No video could be found in this tweet	2026-07-02 05:31:23
+https://x.com/angeldemonxxx_5/status/1983590320341467473	file missing after download	2026-07-02 05:31:25
+https://x.com/yonixyow/status/2069752434801402331	file missing after download	2026-07-02 05:31:27
+https://x.com/maker_milly/status/2019527958633836868	file missing after download	2026-07-02 05:31:29
