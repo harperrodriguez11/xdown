@@ -816,39 +816,40 @@ def upload_files_to_folder(folder_id, filepaths, concurrency=4):
 
 # ─────────────────── Google Sheets metadata log ──────────────────────────────
 
-SHEET_TAB       = "Sheet1"
+# Fixed target spreadsheet — we always write into THIS sheet, never create a
+# new one. Taken from:
+# https://docs.google.com/spreadsheets/d/12KXL16nrcpsPXCrtycvt9it-irK4vPjJQm4anAILNFk/edit
+DEFAULT_SHEET_ID = "12KXL16nrcpsPXCrtycvt9it-irK4vPjJQm4anAILNFk"
+
 SHEET_HEADER    = ["File Name", "Caption", "Tweet URL", "Type"]
 
-def find_or_create_spreadsheet(drive_service, sheets_service, name):
-    """Reuses an existing spreadsheet with this exact name if one exists
-    (so repeated workflow runs keep appending to the same 'allmeta' sheet),
-    otherwise creates a new one."""
-    q = f"name='{name}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-    res = drive_service.files().list(q=q, fields="files(id, name, webViewLink)", pageSize=1).execute()
-    files = res.get("files", [])
-    if files:
-        return files[0]["id"], files[0].get("webViewLink")
-    spreadsheet = sheets_service.spreadsheets().create(
-        body={"properties": {"title": name}},
-        fields="spreadsheetId, spreadsheetUrl"
+def get_spreadsheet_info(sheets_service, spreadsheet_id):
+    """Fetches the spreadsheet's first tab name + shareable link. We look up
+    the real tab name instead of assuming 'Sheet1', since existing sheets are
+    often renamed (e.g. 'allmeta', 'Data', etc.)."""
+    meta = sheets_service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="spreadsheetUrl,sheets(properties(title))"
     ).execute()
-    return spreadsheet["spreadsheetId"], spreadsheet.get("spreadsheetUrl")
+    sheets = meta.get("sheets", [])
+    tab_name = sheets[0]["properties"]["title"] if sheets else "Sheet1"
+    return tab_name, meta.get("spreadsheetUrl")
 
-def ensure_sheet_header(sheets_service, spreadsheet_id):
+def ensure_sheet_header(sheets_service, spreadsheet_id, tab_name):
     result = sheets_service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id, range=f"{SHEET_TAB}!A1:D1"
+        spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A1:D1"
     ).execute()
     if not result.get("values"):
         sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id, range=f"{SHEET_TAB}!A1",
+            spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A1",
             valueInputOption="RAW",
             body={"values": [SHEET_HEADER]}
         ).execute()
 
-def append_rows_to_sheet(sheets_service, spreadsheet_id, rows):
+def append_rows_to_sheet(sheets_service, spreadsheet_id, tab_name, rows):
     if not rows: return
     sheets_service.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id, range=f"{SHEET_TAB}!A1",
+        spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A1",
         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
         body={"values": rows}
     ).execute()
@@ -867,8 +868,9 @@ def main():
                          help="How many tweets to download in parallel.")
     parser.add_argument("--upload-concurrency", default="4",
                          help="How many files to upload to Drive in parallel.")
-    parser.add_argument("--sheet-name", default="allmeta",
-                         help="Google Sheet to log {file name, caption, url, type} into. Reused across runs if it already exists.")
+    parser.add_argument("--sheet-id", default=DEFAULT_SHEET_ID,
+                         help="Spreadsheet ID (from its URL) to log {file name, caption, url, type} into. "
+                              "We always write into this existing sheet — never create a new one.")
     parser.add_argument("--include-urls-in-caption", default="true",
                          help="true/false — keep links (e.g. t.co) in the saved caption. Default: true.")
     parser.add_argument("--include-hashtags-in-caption", default="false",
@@ -890,11 +892,11 @@ def main():
     include_urls      = _to_bool(args.include_urls_in_caption)
     include_hashtags  = _to_bool(args.include_hashtags_in_caption)
     full_caption      = _to_bool(args.full_caption)
-    sheet_name        = args.sheet_name.strip() or "allmeta"
+    sheet_id          = args.sheet_id.strip() or DEFAULT_SHEET_ID
 
     caption_mode = "FULL (raw, unmodified)" if full_caption else \
         f"urls={'on' if include_urls else 'off'}, hashtags={'on' if include_hashtags else 'off'}"
-    print(f"📝 Caption mode: {caption_mode} | Sheet: '{sheet_name}'")
+    print(f"📝 Caption mode: {caption_mode} | Sheet ID: {sheet_id}")
 
     # ── Early exit: no URLs file ─────────────────────────────────────────
     if not os.path.exists(URLS_FILE):
@@ -971,19 +973,19 @@ def main():
     rows_logged = 0
     try:
         sheets_service = get_sheets_service()
-        sheet_id, sheet_link = find_or_create_spreadsheet(service, sheets_service, sheet_name)
-        ensure_sheet_header(sheets_service, sheet_id)
+        tab_name, sheet_link = get_spreadsheet_info(sheets_service, sheet_id)
+        ensure_sheet_header(sheets_service, sheet_id, tab_name)
         rows = [
             [m['name'], m['caption'], m['url'], m['kind']]
             for m in file_meta
             if m['name'] in uploaded_names
         ]
-        append_rows_to_sheet(sheets_service, sheet_id, rows)
+        append_rows_to_sheet(sheets_service, sheet_id, tab_name, rows)
         rows_logged = len(rows)
-        print(f"\n📝 Logged {rows_logged} row(s) to sheet '{sheet_name}'.")
+        print(f"\n📝 Logged {rows_logged} row(s) to sheet (tab '{tab_name}').")
         if sheet_link: print(f"🔗 {sheet_link}")
     except Exception as e:
-        print(f"\n⚠️  Google Sheet logging failed: {str(e)[:200]}")
+        print(f"\n⚠️  Google Sheet logging failed: {str(e)[:300]}")
 
     if summary_path:
         with open(summary_path,"a") as f:
@@ -998,7 +1000,7 @@ def main():
                     f"**Drive folder:** [{folder_name}]({folder_link})\n\n"
                     + "\n".join(f"- {n}" for n in sorted(uploaded_names)) + "\n")
             if sheet_link:
-                f.write(f"\n**Metadata sheet:** [{sheet_name}]({sheet_link})\n")
+                f.write(f"\n**Metadata sheet:** [{sheet_id}]({sheet_link})\n")
             if failed_uploads:
                 f.write("\n**Upload failures:**\n" + "\n".join(f"- {n}: {e}" for n, e in failed_uploads) + "\n")
 
