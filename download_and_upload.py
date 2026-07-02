@@ -217,7 +217,7 @@ def _ydl_download_opts(cookiefile, max_seconds):
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': os.path.join(
             DOWNLOAD_DIR,
-            '%(uploader)s_%(upload_date)s_%(title).60s_[%(id)s].%(ext)s'
+            '%(upload_date)s_%(title).60s_[%(id)s].%(ext)s'
         ),
         'merge_output_format': 'mp4',
         'restrictfilenames': True,
